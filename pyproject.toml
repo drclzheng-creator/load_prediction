@@ -1,0 +1,49 @@
+[project]
+name = "load-prediction"
+version = "0.1.0"
+description = "Extensible multi-scale load forecasting framework for VPP and industrial load scenarios."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "lightgbm>=4.0",
+    "matplotlib>=3.8",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "scikit-learn>=1.4",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+autogluon = [
+    "autogluon.timeseries",
+    "darts",
+]
+darts = [
+    "u8darts[notorch]",
+]
+torch = [
+    "torch",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+load-forecast = "load_prediction.cli:app"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-s"
+log_cli = true
+log_cli_level = "INFO"

@@ -1,0 +1,5 @@
+from tests.inference.inference_helpers import run_short_term_4h_lightgbm_saved_model_inference
+
+
+def test_short_term_4h_lightgbm_online_inference_saved_model():
+    run_short_term_4h_lightgbm_saved_model_inference()

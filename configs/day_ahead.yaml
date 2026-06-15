@@ -1,0 +1,93 @@
+scale_name: day_ahead
+data:
+  path: inputs/EWELD/eweld_industrial_u141_2018_2019_15min.csv
+  timestamp_col: timestamp
+  target_col: target
+  item_id_col: item_id
+  freq: 15min
+  covariate_cols:
+    - temperature_f
+    - dew_point_f
+    - humidity_pct
+    - wind_direction
+    - wind_speed_mph
+    - wind_gust_mph
+    - pressure_in
+cleaning:
+  resample: true
+  upsample_strategy: warn_interpolate
+  missing_strategy: hybrid
+  short_gap_limit: 3
+  outlier_method: iqr
+  outlier_iqr_multiplier: 3.0
+  non_negative_target: true
+feature:
+  add_calendar: true
+  add_cyclical_time: true
+  add_item_id: true
+  lag_steps:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 96
+    - 192
+    - 672
+  rolling_windows:
+    - 4
+    - 16
+    - 96
+  correlation_threshold: 0.0
+  known_covariates:
+    - temperature_f
+    - dew_point_f
+    - humidity_pct
+    - wind_direction
+    - wind_speed_mph
+    - wind_gust_mph
+    - pressure_in
+model:
+  name: lightgbm
+  random_state: 42
+  scale_features: false
+  scale_target: false
+  params:
+    n_estimators: 300
+    learning_rate: 0.05
+    objective: regression_l1
+    num_leaves: 31
+    enable_quantiles: true
+    lower_quantile: 0.1
+    upper_quantile: 0.9
+    quantile_levels:
+      - 0.05
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      - 0.5
+      - 0.6
+      - 0.7
+      - 0.8
+      - 0.9
+      - 0.95
+evaluation:
+  split_strategy: ratio
+  train_ratio: 0.7
+  holdout_length:
+  metrics:
+    - mae
+    - rmse
+    - mape
+postprocess:
+  clip_negative: true
+  add_residual_interval: true
+  interval_width: 1.96
+output:
+  root_dir: outputs
+  save_model: true
+  save_artifacts: true
+  save_plot: true
+  save_metrics: true
