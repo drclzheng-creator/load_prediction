@@ -16,6 +16,7 @@ from load_prediction.models.base_forecaster import ForecastFrame
 from load_prediction.models.gmm_forecaster import GMMForecaster
 from load_prediction.models.lstm_forecaster import LSTMForecaster
 from load_prediction.models.mdn_forecaster import MDNForecaster
+from load_prediction.models.parameter_tuning import TuningConfig, tune_pipeline
 from load_prediction.pipeline import LoadForecastPipeline
 
 DEFAULT_CONFIG = Path("configs/day_ahead.yaml")
@@ -356,6 +357,65 @@ def run_lightgbm_pipeline():
     assert (result.forecast.frame["prediction"] >= 0).all()
 
 
+def run_lightgbm_pipeline_with_parameter_tuning(
+    enable_parameter_tuning: bool = False,
+    n_trials: int = 2,
+    save_trial_outputs: bool = True,
+):
+    config = _with_time_range(_day_ahead_config())
+    _run_pipeline_with_parameter_tuning(
+        config,
+        enable_parameter_tuning=enable_parameter_tuning,
+        n_trials=n_trials,
+        save_trial_outputs=save_trial_outputs,
+    )
+
+
+def _run_pipeline_with_parameter_tuning(
+    config: PipelineConfig,
+    enable_parameter_tuning: bool = False,
+    n_trials: int = 2,
+    save_trial_outputs: bool = True,
+):
+    if not enable_parameter_tuning:
+        import pytest
+
+        pytest.skip(
+            "Pass enable_parameter_tuning=True to run real Optuna tuning"
+        )
+
+    data = _load_data(config)
+
+    tuning = TuningConfig(
+        n_trials=n_trials,
+        metric_name="mae",
+        direction="minimize",
+        study_name=f"{config.model.name}_{config.scale.name}",
+        save_trial_outputs=save_trial_outputs,
+        tuning_run_name="tuning",
+    )
+    result = tune_pipeline(config, data, tuning_config=tuning)
+
+    assert result.best_trial_number >= 0
+    assert result.best_value > 0
+    assert result.best_params
+    assert result.best_config.model.name == config.model.name
+
+    tuning_dir = Path(config.output.root_dir) / config.model.name / config.scale.name
+    if config.output.run_name:
+        tuning_dir = tuning_dir / config.output.run_name
+    tuning_dir = tuning_dir / "tuning"
+    summary_path = tuning_dir / "tuning_summary.json"
+    assert tuning_dir.exists()
+    assert any(tuning_dir.glob("trial_*/artifacts/metrics.json"))
+    assert summary_path.exists()
+
+    tuning_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert tuning_summary["best_trial_number"] == result.best_trial_number
+    assert tuning_summary["best_value"] == result.best_value
+    assert tuning_summary["best_params"] == result.best_params
+
+
 def run_short_term_4h_lightgbm_pipeline():
     config = _with_time_range(_short_term_4h_config())
     data = _load_data(config)
@@ -376,10 +436,49 @@ def run_short_term_4h_lightgbm_pipeline():
     _assert_distribution_grid(result.forecast.frame)
 
 
+def run_short_term_4h_lightgbm_pipeline_with_parameter_tuning(
+    enable_parameter_tuning: bool = False,
+    n_trials: int = 2,
+    save_trial_outputs: bool = True,
+):
+    _run_pipeline_with_parameter_tuning(
+        _with_time_range(_short_term_4h_config()),
+        enable_parameter_tuning=enable_parameter_tuning,
+        n_trials=n_trials,
+        save_trial_outputs=save_trial_outputs,
+    )
+
+
 
 def run_sklearn_pipeline():
+    config = _sklearn_config()
+    data = _load_data(config)
+
+    pipeline = LoadForecastPipeline(config)
+    result = pipeline.run(data)
+
+    _assert_day_ahead_run_outputs(result, "sklearn_hist_gradient_boosting")
+    _assert_basic_forecast_result(result, config.scale.prediction_length)
+    _assert_quantile_forecast_columns(result.forecast.frame)
+    _assert_distribution_grid(result.forecast.frame)
+
+
+def run_sklearn_pipeline_with_parameter_tuning(
+    enable_parameter_tuning: bool = False,
+    n_trials: int = 2,
+    save_trial_outputs: bool = True,
+):
+    _run_pipeline_with_parameter_tuning(
+        _sklearn_config(),
+        enable_parameter_tuning=enable_parameter_tuning,
+        n_trials=n_trials,
+        save_trial_outputs=save_trial_outputs,
+    )
+
+
+def _sklearn_config() -> PipelineConfig:
     base_config = _with_time_range(_day_ahead_config())
-    config = _with_model(
+    return _with_model(
         base_config,
         ModelSpecConfig(
             name="sklearn_hist_gradient_boosting",
@@ -406,20 +505,53 @@ def run_sklearn_pipeline():
             },
         ),
     )
+
+
+def run_mdn_pipeline():
+    config = _mdn_config()
     data = _load_data(config)
 
     pipeline = LoadForecastPipeline(config)
     result = pipeline.run(data)
 
-    _assert_day_ahead_run_outputs(result, "sklearn_hist_gradient_boosting")
+    _assert_day_ahead_run_outputs(result, "mdn", run_name="e2e_mdn")
+    assert isinstance(pipeline.model, MDNForecaster)
     _assert_basic_forecast_result(result, config.scale.prediction_length)
-    _assert_quantile_forecast_columns(result.forecast.frame)
+    expected_columns = {
+        "prediction",
+        "0.1",
+        "0.9",
+        "prediction_lower",
+        "prediction_upper",
+        "prediction_density",
+        "mdn_weights",
+        "mdn_means",
+        "mdn_stds",
+        "distribution_values",
+        "distribution_probabilities",
+    }
+    assert expected_columns.issubset(result.forecast.frame.columns)
     _assert_distribution_grid(result.forecast.frame)
+    loaded = MDNForecaster.load(result.model_path, device="cpu")
+    assert loaded.fitted_ is True
 
 
-def run_mdn_pipeline():
+def run_mdn_pipeline_with_parameter_tuning(
+    enable_parameter_tuning: bool = False,
+    n_trials: int = 2,
+    save_trial_outputs: bool = True,
+):
+    _run_pipeline_with_parameter_tuning(
+        _mdn_config(),
+        enable_parameter_tuning=enable_parameter_tuning,
+        n_trials=n_trials,
+        save_trial_outputs=save_trial_outputs,
+    )
+
+
+def _mdn_config() -> PipelineConfig:
     base_config = _with_time_range(_day_ahead_config())
-    config = PipelineConfig(
+    return PipelineConfig(
         data=base_config.data,
         cleaning=base_config.cleaning,
         model=ModelSpecConfig(
@@ -455,70 +587,10 @@ def run_mdn_pipeline():
         ),
         scale=base_config.scale,
     )
-    data = _load_data(config)
-
-    pipeline = LoadForecastPipeline(config)
-    result = pipeline.run(data)
-
-    _assert_day_ahead_run_outputs(result, "mdn", run_name="e2e_mdn")
-    assert isinstance(pipeline.model, MDNForecaster)
-    _assert_basic_forecast_result(result, config.scale.prediction_length)
-    expected_columns = {
-        "prediction",
-        "0.1",
-        "0.9",
-        "prediction_lower",
-        "prediction_upper",
-        "prediction_density",
-        "mdn_weights",
-        "mdn_means",
-        "mdn_stds",
-        "distribution_values",
-        "distribution_probabilities",
-    }
-    assert expected_columns.issubset(result.forecast.frame.columns)
-    _assert_distribution_grid(result.forecast.frame)
-    loaded = MDNForecaster.load(result.model_path, device="cpu")
-    assert loaded.fitted_ is True
 
 
 def run_gmm_pipeline_with_distribution_plots():
-    base_config = _with_time_range(_day_ahead_config())
-    config = PipelineConfig(
-        data=base_config.data,
-        cleaning=base_config.cleaning,
-        model=ModelSpecConfig(
-            name="gmm",
-            random_state=42,
-            params={
-                "n_components": 3,
-                "point_estimator": "lightgbm",
-                "point_params": {
-                    "n_estimators": 300,
-                    "learning_rate": 0.05,
-                    "objective": "regression_l1",
-                    "num_leaves": 31,
-                    "n_jobs": 1,
-                    "verbosity": -1,
-                },
-                "distribution_grid_size": 80,
-                "distribution_std_width": 4.0,
-                "gmm_max_iter": 120,
-                "n_init": 2,
-            },
-        ),
-        evaluation=base_config.evaluation,
-        postprocess=base_config.postprocess,
-        output=ArtifactConfig(
-            root_dir=base_config.output.root_dir,
-            run_name="e2e_probability_plots",
-            save_model=True,
-            save_artifacts=True,
-            save_plot=True,
-            save_metrics=True,
-        ),
-        scale=base_config.scale,
-    )
+    config = _gmm_config()
     data = _load_data(config)
 
     pipeline = LoadForecastPipeline(config)
@@ -559,6 +631,58 @@ def run_gmm_pipeline_with_distribution_plots():
     assert len(sample_distribution_paths) == 5
 
 
+def run_gmm_pipeline_with_parameter_tuning(
+    enable_parameter_tuning: bool = False,
+    n_trials: int = 2,
+    save_trial_outputs: bool = True,
+):
+    _run_pipeline_with_parameter_tuning(
+        _gmm_config(),
+        enable_parameter_tuning=enable_parameter_tuning,
+        n_trials=n_trials,
+        save_trial_outputs=save_trial_outputs,
+    )
+
+
+def _gmm_config() -> PipelineConfig:
+    base_config = _with_time_range(_day_ahead_config())
+    return PipelineConfig(
+        data=base_config.data,
+        cleaning=base_config.cleaning,
+        model=ModelSpecConfig(
+            name="gmm",
+            random_state=42,
+            params={
+                "n_components": 3,
+                "point_estimator": "lightgbm",
+                "point_params": {
+                    "n_estimators": 300,
+                    "learning_rate": 0.05,
+                    "objective": "regression_l1",
+                    "num_leaves": 31,
+                    "n_jobs": 1,
+                    "verbosity": -1,
+                },
+                "distribution_grid_size": 80,
+                "distribution_std_width": 4.0,
+                "gmm_max_iter": 120,
+                "n_init": 2,
+            },
+        ),
+        evaluation=base_config.evaluation,
+        postprocess=base_config.postprocess,
+        output=ArtifactConfig(
+            root_dir=base_config.output.root_dir,
+            run_name="e2e_probability_plots",
+            save_model=True,
+            save_artifacts=True,
+            save_plot=True,
+            save_metrics=True,
+        ),
+        scale=base_config.scale,
+    )
+
+
 def run_autogluon_pipeline():
     config = _with_model(_with_time_range(_day_ahead_config()), _autogluon_model_config())
     data = _load_data(config)
@@ -572,34 +696,21 @@ def run_autogluon_pipeline():
     _assert_distribution_grid(result.forecast.frame)
 
 
-def run_lstm_pipeline():
-    base_config = _with_time_range(_day_ahead_config())
-    config = _with_model(
-        base_config,
-        ModelSpecConfig(
-            name="lstm",
-            random_state=42,
-            params={
-                "context_length": 672,
-                "hidden_size": 64,
-                "num_layers": 1,
-                "dropout": 0.1,
-                "epochs": 50,
-                "batch_size": 128,
-                "learning_rate": 0.001,
-                "weight_decay": 0.0,
-                "max_train_samples": 4096,
-                "train_sample_strategy": "last",
-                "device": "cpu",
-                "validation_fraction": 0.1,
-                "early_stopping_patience": 5,
-                "early_stopping_min_delta": 1e-4,
-                "use_point_head": False,
-                "nll_loss_weight": 1.0,
-                "point_loss_weight": 0.0,
-            },
-        ),
+def run_autogluon_pipeline_with_parameter_tuning(
+    enable_parameter_tuning: bool = False,
+    n_trials: int = 2,
+    save_trial_outputs: bool = True,
+):
+    _run_pipeline_with_parameter_tuning(
+        _with_model(_with_time_range(_day_ahead_config()), _autogluon_model_config()),
+        enable_parameter_tuning=enable_parameter_tuning,
+        n_trials=n_trials,
+        save_trial_outputs=save_trial_outputs,
     )
+
+
+def run_lstm_pipeline():
+    config = _lstm_config()
     data = _load_data(config)
 
     pipeline = LoadForecastPipeline(config)
@@ -640,6 +751,49 @@ def run_lstm_pipeline():
     assert result.training_history_csv_path.exists()
 
 
+def run_lstm_pipeline_with_parameter_tuning(
+    enable_parameter_tuning: bool = False,
+    n_trials: int = 2,
+    save_trial_outputs: bool = True,
+):
+    _run_pipeline_with_parameter_tuning(
+        _lstm_config(),
+        enable_parameter_tuning=enable_parameter_tuning,
+        n_trials=n_trials,
+        save_trial_outputs=save_trial_outputs,
+    )
+
+
+def _lstm_config() -> PipelineConfig:
+    base_config = _with_time_range(_day_ahead_config())
+    return _with_model(
+        base_config,
+        ModelSpecConfig(
+            name="lstm",
+            random_state=42,
+            params={
+                "context_length": 672,
+                "hidden_size": 64,
+                "num_layers": 1,
+                "dropout": 0.1,
+                "epochs": 50,
+                "batch_size": 128,
+                "learning_rate": 0.001,
+                "weight_decay": 0.0,
+                "max_train_samples": 4096,
+                "train_sample_strategy": "last",
+                "device": "cpu",
+                "validation_fraction": 0.1,
+                "early_stopping_patience": 5,
+                "early_stopping_min_delta": 1e-4,
+                "use_point_head": False,
+                "nll_loss_weight": 1.0,
+                "point_loss_weight": 0.0,
+            },
+        ),
+    )
+
+
 def run_lstm_config_params():
     config = _day_ahead_config()
     forecaster = LSTMForecaster.from_config(
@@ -673,8 +827,48 @@ def run_lstm_config_params():
 
 
 def run_bilstm_pipeline():
+    config = _bilstm_config()
+    data = _load_data(config)
+
+    pipeline = LoadForecastPipeline(config)
+    result = pipeline.run(data)
+
+    _assert_day_ahead_run_outputs(result, "bilstm")
+    assert isinstance(pipeline.model, LSTMForecaster)
+    assert pipeline.model.bidirectional is True
+    loaded = LSTMForecaster.load(result.model_path, device="cpu")
+    assert loaded.bidirectional is True
+    _assert_basic_forecast_result(result, config.scale.prediction_length)
+    assert {
+        "0.1",
+        "0.9",
+        "prediction_lower",
+        "prediction_upper",
+        "prediction_density",
+        "lstm_weights",
+        "lstm_means",
+        "lstm_stds",
+        "distribution_values",
+        "distribution_probabilities",
+    }.issubset(result.forecast.frame.columns)
+
+
+def run_bilstm_pipeline_with_parameter_tuning(
+    enable_parameter_tuning: bool = False,
+    n_trials: int = 2,
+    save_trial_outputs: bool = True,
+):
+    _run_pipeline_with_parameter_tuning(
+        _bilstm_config(),
+        enable_parameter_tuning=enable_parameter_tuning,
+        n_trials=n_trials,
+        save_trial_outputs=save_trial_outputs,
+    )
+
+
+def _bilstm_config() -> PipelineConfig:
     base_config = _with_time_range(_day_ahead_config())
-    config = _with_model(
+    return _with_model(
         base_config,
         ModelSpecConfig(
             name="bilstm",
@@ -700,26 +894,3 @@ def run_bilstm_pipeline():
             },
         ),
     )
-    data = _load_data(config)
-
-    pipeline = LoadForecastPipeline(config)
-    result = pipeline.run(data)
-
-    _assert_day_ahead_run_outputs(result, "bilstm")
-    assert isinstance(pipeline.model, LSTMForecaster)
-    assert pipeline.model.bidirectional is True
-    loaded = LSTMForecaster.load(result.model_path, device="cpu")
-    assert loaded.bidirectional is True
-    _assert_basic_forecast_result(result, config.scale.prediction_length)
-    assert {
-        "0.1",
-        "0.9",
-        "prediction_lower",
-        "prediction_upper",
-        "prediction_density",
-        "lstm_weights",
-        "lstm_means",
-        "lstm_stds",
-        "distribution_values",
-        "distribution_probabilities",
-    }.issubset(result.forecast.frame.columns)

@@ -30,6 +30,9 @@ torch = [
 dev = [
     "pytest>=8.0",
 ]
+tuning = [
+    "optuna>=3.6",
+]
 
 [project.scripts]
 load-forecast = "load_prediction.cli:app"
