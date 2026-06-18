@@ -19,6 +19,7 @@ from load_prediction.configs.model_spec_config import ModelSpecConfig
 from load_prediction.configs.pipeline_config import PipelineConfig
 from load_prediction.configs.point_scenario_config import PointScenarioConfig
 from load_prediction.configs.validation_config import ValidationConfig
+from load_prediction.configs.vmd_config import VMDConfig
 
 __all__ = [
     "ArtifactConfig",
@@ -34,6 +35,7 @@ __all__ = [
     "PipelineConfig",
     "PointScenarioConfig",
     "SUPPORTED_FORECAST_PROFILES",
+    "VMDConfig",
     "forecast_profile_preset",
     "pipeline_config_from_dict",
 ]

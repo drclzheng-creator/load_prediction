@@ -5,6 +5,7 @@ description = "Extensible multi-scale load forecasting framework for VPP and ind
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "chinesecalendar>=1.9",
     "lightgbm>=4.0",
     "matplotlib>=3.8",
     "numpy>=2.0",

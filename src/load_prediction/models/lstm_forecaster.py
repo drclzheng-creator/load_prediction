@@ -16,6 +16,10 @@ from sklearn.preprocessing import StandardScaler
 
 from load_prediction.configs import ModelSpecConfig, ForecastProfileConfig
 from load_prediction.data.data_schema import TimeSeriesDataset
+from load_prediction.features.chinese_calendar_features import (
+    CHINESE_CALENDAR_FEATURE_COLUMNS,
+    build_chinese_calendar_feature_frame,
+)
 from load_prediction.models.base_forecaster import BaseForecastModel, ForecastFrame
 
 logger = logging.getLogger(__name__)
@@ -124,6 +128,294 @@ class _LSTMMDNNet:
         return Net()
 
 
+class _CNNLSTMMDNNet:
+    """CNN frontend plus LSTM encoder with the same MDN output contract."""
+
+    @staticmethod
+    def build(
+        history_numeric_size: int,
+        future_numeric_size: int,
+        categorical_cardinalities: list[int],
+        embedding_dims: list[int],
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        n_components: int,
+        min_std: float,
+        bidirectional: bool = False,
+        use_point_head: bool = False,
+        cnn_channels: int = 32,
+        cnn_kernel_size: int = 5,
+        cnn_layers: int = 1,
+    ):
+        torch, nn, _, _ = _import_torch()
+
+        class Net(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                if len(categorical_cardinalities) != len(embedding_dims):
+                    raise ValueError("categorical_cardinalities and embedding_dims must have the same length")
+                self.embeddings = nn.ModuleList(
+                    [
+                        nn.Embedding(cardinality + 1, embedding_dim)
+                        for cardinality, embedding_dim in zip(categorical_cardinalities, embedding_dims)
+                    ]
+                )
+                embedded_size = int(sum(embedding_dims))
+                input_size = history_numeric_size + embedded_size
+                future_size = future_numeric_size + embedded_size
+                kernel_size = int(cnn_kernel_size)
+                if kernel_size <= 0 or kernel_size % 2 == 0:
+                    raise ValueError("cnn_kernel_size must be a positive odd integer")
+                layers = []
+                in_channels = input_size
+                for _ in range(max(1, int(cnn_layers))):
+                    layers.extend(
+                        [
+                            nn.Conv1d(
+                                in_channels=in_channels,
+                                out_channels=cnn_channels,
+                                kernel_size=kernel_size,
+                                padding=kernel_size // 2,
+                            ),
+                            nn.ReLU(),
+                            nn.Dropout(dropout),
+                        ]
+                    )
+                    in_channels = cnn_channels
+                self.cnn = nn.Sequential(*layers)
+                lstm_dropout = dropout if num_layers > 1 else 0.0
+                self.encoder = nn.LSTM(
+                    input_size=cnn_channels,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    batch_first=True,
+                    dropout=lstm_dropout,
+                    bidirectional=bidirectional,
+                )
+                context_size = hidden_size * 2 if bidirectional else hidden_size
+                self.head = nn.Sequential(
+                    nn.Linear(context_size + future_size, hidden_size),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size, n_components * 3),
+                )
+                self.point_head = None
+                if use_point_head:
+                    self.point_head = nn.Sequential(
+                        nn.Linear(context_size + future_size, hidden_size),
+                        nn.ReLU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hidden_size, 1),
+                    )
+                self.n_components = n_components
+                self.min_std = min_std
+
+            def _concat_features(self, numeric, categorical):
+                if not self.embeddings:
+                    return numeric
+                embedded = [
+                    embedding(categorical[..., idx].long())
+                    for idx, embedding in enumerate(self.embeddings)
+                ]
+                return torch.cat([numeric, *embedded], dim=-1)
+
+            def forward(self, history_numeric, history_categorical, future_numeric, future_categorical):
+                history = self._concat_features(history_numeric, history_categorical)
+                future = self._concat_features(future_numeric, future_categorical)
+                history = self.cnn(history.transpose(1, 2)).transpose(1, 2)
+                _, (hidden, _) = self.encoder(history)
+                if bidirectional:
+                    context = torch.cat([hidden[-2], hidden[-1]], dim=-1)
+                else:
+                    context = hidden[-1]
+                horizon = future.shape[1]
+                context = context.unsqueeze(1).expand(-1, horizon, -1)
+                decoder_features = torch.cat([context, future], dim=-1)
+                raw = self.head(decoder_features)
+                raw = raw.reshape(*raw.shape[:-1], self.n_components, 3)
+                weights = torch.nn.functional.softmax(raw[..., 0], dim=-1)
+                means = raw[..., 1]
+                stds = torch.nn.functional.softplus(raw[..., 2]) + self.min_std
+                point = None
+                if self.point_head is not None:
+                    point = self.point_head(decoder_features).squeeze(-1)
+                return weights, means, stds, point
+
+        return Net()
+
+
+class _CNNLSTMAttentionMDNNet:
+    """CNN frontend plus LSTM encoder with anchor temporal attention and MDN output."""
+
+    @staticmethod
+    def build(
+        history_numeric_size: int,
+        future_numeric_size: int,
+        categorical_cardinalities: list[int],
+        embedding_dims: list[int],
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        n_components: int,
+        min_std: float,
+        bidirectional: bool = False,
+        use_point_head: bool = False,
+        cnn_channels: int = 32,
+        cnn_kernel_size: int = 5,
+        cnn_layers: int = 1,
+        attention_hidden_size: int | None = None,
+        attention_recent_steps: int = 32,
+        attention_anchor_periods: tuple[int, ...] = (96, 192, 672),
+        attention_anchor_window: int = 4,
+    ):
+        torch, nn, _, _ = _import_torch()
+
+        class Net(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                if len(categorical_cardinalities) != len(embedding_dims):
+                    raise ValueError("categorical_cardinalities and embedding_dims must have the same length")
+                self.embeddings = nn.ModuleList(
+                    [
+                        nn.Embedding(cardinality + 1, embedding_dim)
+                        for cardinality, embedding_dim in zip(categorical_cardinalities, embedding_dims)
+                    ]
+                )
+                embedded_size = int(sum(embedding_dims))
+                input_size = history_numeric_size + embedded_size
+                future_size = future_numeric_size + embedded_size
+                kernel_size = int(cnn_kernel_size)
+                if kernel_size <= 0 or kernel_size % 2 == 0:
+                    raise ValueError("cnn_kernel_size must be a positive odd integer")
+                layers = []
+                in_channels = input_size
+                for _ in range(max(1, int(cnn_layers))):
+                    layers.extend(
+                        [
+                            nn.Conv1d(
+                                in_channels=in_channels,
+                                out_channels=cnn_channels,
+                                kernel_size=kernel_size,
+                                padding=kernel_size // 2,
+                            ),
+                            nn.ReLU(),
+                            nn.Dropout(dropout),
+                        ]
+                    )
+                    in_channels = cnn_channels
+                self.cnn = nn.Sequential(*layers)
+                lstm_dropout = dropout if num_layers > 1 else 0.0
+                self.encoder = nn.LSTM(
+                    input_size=cnn_channels,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    batch_first=True,
+                    dropout=lstm_dropout,
+                    bidirectional=bidirectional,
+                )
+                context_size = hidden_size * 2 if bidirectional else hidden_size
+                attn_size = int(attention_hidden_size or context_size)
+                self.history_attention_projection = nn.Linear(context_size, attn_size, bias=False)
+                self.future_attention_projection = nn.Linear(future_size, attn_size, bias=False)
+                self.attention_score = nn.Linear(attn_size, 1, bias=False)
+                self.attention_dropout = nn.Dropout(dropout)
+                self.attention_recent_steps = max(0, int(attention_recent_steps))
+                self.attention_anchor_periods = tuple(
+                    int(period) for period in attention_anchor_periods if int(period) > 0
+                )
+                self.attention_anchor_window = max(0, int(attention_anchor_window))
+                decoder_size = context_size * 2 + future_size
+                self.head = nn.Sequential(
+                    nn.Linear(decoder_size, hidden_size),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size, n_components * 3),
+                )
+                self.point_head = None
+                if use_point_head:
+                    self.point_head = nn.Sequential(
+                        nn.Linear(decoder_size, hidden_size),
+                        nn.ReLU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hidden_size, 1),
+                    )
+                self.n_components = n_components
+                self.min_std = min_std
+
+            def _concat_features(self, numeric, categorical):
+                if not self.embeddings:
+                    return numeric
+                embedded = [
+                    embedding(categorical[..., idx].long())
+                    for idx, embedding in enumerate(self.embeddings)
+                ]
+                return torch.cat([numeric, *embedded], dim=-1)
+
+            def _attention_indices(self, horizon: int, history_length: int, device):
+                last_index = history_length - 1
+                recent_count = self.attention_recent_steps
+                anchor_radius = self.attention_anchor_window
+                rows = []
+                for horizon_index in range(horizon):
+                    step = horizon_index + 1
+                    indices = []
+                    for recent_offset in range(recent_count, 0, -1):
+                        indices.append(min(max(history_length - recent_offset, 0), last_index))
+                    for period in self.attention_anchor_periods:
+                        base_index = last_index + step - period
+                        for delta in range(-anchor_radius, anchor_radius + 1):
+                            indices.append(min(max(base_index + delta, 0), last_index))
+                    if not indices:
+                        indices.append(last_index)
+                    rows.append(indices)
+                return torch.tensor(rows, dtype=torch.long, device=device)
+
+            def forward(self, history_numeric, history_categorical, future_numeric, future_categorical):
+                history = self._concat_features(history_numeric, history_categorical)
+                future = self._concat_features(future_numeric, future_categorical)
+                history = self.cnn(history.transpose(1, 2)).transpose(1, 2)
+                outputs, (hidden, _) = self.encoder(history)
+                batch_size, history_length, context_size = outputs.shape
+                horizon = future.shape[1]
+                if bidirectional:
+                    final_context = torch.cat([hidden[-2], hidden[-1]], dim=-1)
+                else:
+                    final_context = hidden[-1]
+                final_context = final_context.unsqueeze(1).expand(-1, horizon, -1)
+                indices = self._attention_indices(horizon, history_length, outputs.device)
+                gather_indices = indices.view(1, horizon, -1, 1).expand(
+                    batch_size,
+                    horizon,
+                    -1,
+                    context_size,
+                )
+                selected_outputs = torch.gather(
+                    outputs.unsqueeze(1).expand(-1, horizon, -1, -1),
+                    dim=2,
+                    index=gather_indices,
+                )
+                history_keys = self.history_attention_projection(selected_outputs)
+                future_queries = self.future_attention_projection(future).unsqueeze(2)
+                attention_hidden = torch.tanh(history_keys + future_queries)
+                attention_hidden = self.attention_dropout(attention_hidden)
+                attention_scores = self.attention_score(attention_hidden).squeeze(-1)
+                attention_weights = torch.nn.functional.softmax(attention_scores, dim=-1)
+                context = torch.sum(selected_outputs * attention_weights.unsqueeze(-1), dim=2)
+                decoder_features = torch.cat([final_context, context, future], dim=-1)
+                raw = self.head(decoder_features)
+                raw = raw.reshape(*raw.shape[:-1], self.n_components, 3)
+                weights = torch.nn.functional.softmax(raw[..., 0], dim=-1)
+                means = raw[..., 1]
+                stds = torch.nn.functional.softplus(raw[..., 2]) + self.min_std
+                point = None
+                if self.point_head is not None:
+                    point = self.point_head(decoder_features).squeeze(-1)
+                return weights, means, stds, point
+
+        return Net()
+
+
 @dataclass
 class LSTMForecaster(BaseForecastModel):
     prediction_length: int
@@ -157,6 +449,7 @@ class LSTMForecaster(BaseForecastModel):
     nll_loss_weight: float = 1.0
     point_loss_weight: float = 0.0
     add_calendar_features: bool = True
+    add_chinese_calendar_features: bool = False
     add_lag_features: bool = True
     lag_feature_steps: tuple[int, ...] = (96, 192, 672)
     lower_quantile: float = 0.1
@@ -220,6 +513,10 @@ class LSTMForecaster(BaseForecastModel):
             nll_loss_weight=params.pop("nll_loss_weight", 1.0),
             point_loss_weight=params.pop("point_loss_weight", 0.0),
             add_calendar_features=params.pop("add_calendar_features", True),
+            add_chinese_calendar_features=params.pop(
+                "add_chinese_calendar_features",
+                scale_config.feature.add_chinese_calendar,
+            ),
             add_lag_features=params.pop("add_lag_features", True),
             lag_feature_steps=tuple(params.pop("lag_feature_steps", (96, 192, 672))),
             lower_quantile=params.pop("lower_quantile", 0.1),
@@ -267,18 +564,11 @@ class LSTMForecaster(BaseForecastModel):
                 batch_size=self.batch_size,
                 shuffle=False,
             )
-        self.model = _LSTMMDNNet.build(
+        self.model = self._build_network(
             history_numeric_size=x_hist_num.shape[-1],
             future_numeric_size=x_future_num.shape[-1],
             categorical_cardinalities=self.categorical_cardinalities_ or [],
             embedding_dims=self.embedding_dims_ or [],
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            dropout=self.dropout,
-            n_components=self.n_components,
-            min_std=self.min_std,
-            bidirectional=self.bidirectional,
-            use_point_head=self.use_point_head,
         ).to(self.device)
         optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -569,6 +859,7 @@ class LSTMForecaster(BaseForecastModel):
         saved_numeric_columns = [*saved_history_numeric_columns, *saved_future_numeric_columns]
         has_saved_engineered_features = any(
             str(column).startswith("feature__calendar__")
+            or str(column).startswith("feature__chinese_calendar__")
             or str(column).startswith("feature__time__")
             or str(column).startswith("feature__lag__")
             for column in saved_numeric_columns
@@ -576,7 +867,15 @@ class LSTMForecaster(BaseForecastModel):
         add_calendar_features = metadata.get("add_calendar_features")
         if add_calendar_features is None:
             add_calendar_features = any(
-                str(column).startswith("feature__calendar__") or str(column).startswith("feature__time__")
+                str(column).startswith("feature__calendar__")
+                or str(column).startswith("feature__chinese_calendar__")
+                or str(column).startswith("feature__time__")
+                for column in saved_numeric_columns
+            )
+        add_chinese_calendar_features = metadata.get("add_chinese_calendar_features")
+        if add_chinese_calendar_features is None:
+            add_chinese_calendar_features = any(
+                str(column).startswith("feature__chinese_calendar__")
                 for column in saved_numeric_columns
             )
         add_lag_features = metadata.get("add_lag_features")
@@ -615,6 +914,7 @@ class LSTMForecaster(BaseForecastModel):
             nll_loss_weight=metadata.get("nll_loss_weight", 1.0),
             point_loss_weight=metadata.get("point_loss_weight", 0.0),
             add_calendar_features=bool(add_calendar_features),
+            add_chinese_calendar_features=bool(add_chinese_calendar_features),
             add_lag_features=bool(add_lag_features),
             lag_feature_steps=lag_feature_steps,
             lower_quantile=metadata.get("lower_quantile", 0.1),
@@ -650,20 +950,32 @@ class LSTMForecaster(BaseForecastModel):
         forecaster.embedding_dims_ = state.get("embedding_dims") or metadata.get("embedding_dims") or [
             forecaster._embedding_size(cardinality) for cardinality in forecaster.categorical_cardinalities_
         ]
+        if hasattr(forecaster, "cnn_channels"):
+            forecaster.cnn_channels = int(metadata.get("cnn_channels", forecaster.cnn_channels))
+            forecaster.cnn_kernel_size = int(metadata.get("cnn_kernel_size", forecaster.cnn_kernel_size))
+            forecaster.cnn_layers = int(metadata.get("cnn_layers", forecaster.cnn_layers))
+        if hasattr(forecaster, "attention_hidden_size"):
+            attention_hidden_size = metadata.get("attention_hidden_size", forecaster.attention_hidden_size)
+            forecaster.attention_hidden_size = (
+                None if attention_hidden_size is None else int(attention_hidden_size)
+            )
+            forecaster.attention_recent_steps = int(
+                metadata.get("attention_recent_steps", forecaster.attention_recent_steps)
+            )
+            forecaster.attention_anchor_periods = tuple(
+                int(period)
+                for period in metadata.get("attention_anchor_periods", forecaster.attention_anchor_periods)
+            )
+            forecaster.attention_anchor_window = int(
+                metadata.get("attention_anchor_window", forecaster.attention_anchor_window)
+            )
         forecaster.training_history_ = state.get("training_history") or metadata.get("training_history") or []
         forecaster.residual_std_ = float(state.get("residual_std", metadata.get("residual_std", 0.0)))
-        forecaster.model = _LSTMMDNNet.build(
+        forecaster.model = forecaster._build_network(
             history_numeric_size=len(forecaster.history_numeric_columns_),
             future_numeric_size=len(forecaster.future_numeric_columns_),
             categorical_cardinalities=forecaster.categorical_cardinalities_ or [],
             embedding_dims=forecaster.embedding_dims_ or [],
-            hidden_size=forecaster.hidden_size,
-            num_layers=forecaster.num_layers,
-            dropout=forecaster.dropout,
-            n_components=forecaster.n_components,
-            min_std=forecaster.min_std,
-            bidirectional=forecaster.bidirectional,
-            use_point_head=forecaster.use_point_head,
         ).to(forecaster.device)
         forecaster.model.load_state_dict(checkpoint["state_dict"])
         forecaster.model.eval()
@@ -675,7 +987,7 @@ class LSTMForecaster(BaseForecastModel):
         return {
             "history": list(self.training_history_ or []),
             "metadata": {
-                "model_type": "bilstm" if self.bidirectional else "lstm",
+                "model_type": self._model_type(),
                 "context_length": self.context_length,
                 "prediction_length": self.prediction_length,
                 "batch_size": self.batch_size,
@@ -696,6 +1008,7 @@ class LSTMForecaster(BaseForecastModel):
                 "nll_loss_weight": self.nll_loss_weight,
                 "point_loss_weight": self.point_loss_weight,
                 "add_calendar_features": self.add_calendar_features,
+                "add_chinese_calendar_features": self.add_chinese_calendar_features,
                 "add_lag_features": self.add_lag_features,
                 "lag_feature_steps": self.lag_feature_steps,
                 "history_numeric_columns": self.history_numeric_columns_,
@@ -705,6 +1018,30 @@ class LSTMForecaster(BaseForecastModel):
                 "embedding_dims": self.embedding_dims_,
             },
         }
+
+    def _build_network(
+        self,
+        history_numeric_size: int,
+        future_numeric_size: int,
+        categorical_cardinalities: list[int],
+        embedding_dims: list[int],
+    ) -> Any:
+        return _LSTMMDNNet.build(
+            history_numeric_size=history_numeric_size,
+            future_numeric_size=future_numeric_size,
+            categorical_cardinalities=categorical_cardinalities,
+            embedding_dims=embedding_dims,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            n_components=self.n_components,
+            min_std=self.min_std,
+            bidirectional=self.bidirectional,
+            use_point_head=self.use_point_head,
+        )
+
+    def _model_type(self) -> str:
+        return "bilstm" if self.bidirectional else "lstm"
 
     def _set_seed(self, torch: Any) -> None:
         random.seed(self.random_state)
@@ -788,7 +1125,7 @@ class LSTMForecaster(BaseForecastModel):
         return prepared
 
     def _calendar_feature_columns(self) -> list[str]:
-        return [
+        columns = [
             "feature__calendar__dayofweek",
             "feature__calendar__is_weekend",
             "feature__calendar__month",
@@ -800,6 +1137,9 @@ class LSTMForecaster(BaseForecastModel):
             "feature__time__sin_week",
             "feature__time__cos_week",
         ]
+        if self.add_chinese_calendar_features:
+            columns.extend(CHINESE_CALENDAR_FEATURE_COLUMNS)
+        return columns
 
     def _lag_feature_columns(self) -> list[str]:
         return [f"feature__lag__{int(lag)}" for lag in self.lag_feature_steps]
@@ -822,6 +1162,11 @@ class LSTMForecaster(BaseForecastModel):
         prepared["feature__calendar__day"] = ts.dt.day.to_numpy(dtype=float)
         prepared["feature__calendar__hour"] = ts.dt.hour.to_numpy(dtype=float)
         prepared["feature__calendar__minute"] = ts.dt.minute.to_numpy(dtype=float)
+        if self.add_chinese_calendar_features:
+            prepared = pd.concat(
+                [prepared, build_chinese_calendar_feature_frame(ts)],
+                axis=1,
+            )
         prepared["feature__time__sin_day"] = np.sin(2 * np.pi * minute_of_day / 1440)
         prepared["feature__time__cos_day"] = np.cos(2 * np.pi * minute_of_day / 1440)
         prepared["feature__time__sin_week"] = np.sin(
@@ -1146,6 +1491,7 @@ class LSTMForecaster(BaseForecastModel):
 
     def _metadata(self) -> dict[str, Any]:
         return {
+            "model_type": self._model_type(),
             "prediction_length": self.prediction_length,
             "freq": self.freq,
             "known_covariates_names": self.known_covariates_names,
@@ -1177,6 +1523,7 @@ class LSTMForecaster(BaseForecastModel):
             "nll_loss_weight": self.nll_loss_weight,
             "point_loss_weight": self.point_loss_weight,
             "add_calendar_features": self.add_calendar_features,
+            "add_chinese_calendar_features": self.add_chinese_calendar_features,
             "add_lag_features": self.add_lag_features,
             "lag_feature_steps": self.lag_feature_steps,
             "lower_quantile": self.lower_quantile,
@@ -1193,6 +1540,179 @@ class LSTMForecaster(BaseForecastModel):
             "training_history": self.training_history_,
             "residual_std": self.residual_std_,
         }
+
+
+@dataclass
+class CNNLSTMForecaster(LSTMForecaster):
+    """LSTM forecaster with a lightweight 1D CNN frontend for local patterns."""
+
+    cnn_channels: int = 32
+    cnn_kernel_size: int = 5
+    cnn_layers: int = 1
+
+    @classmethod
+    def from_config(
+        cls,
+        model_config: ModelSpecConfig,
+        scale_config: ForecastProfileConfig,
+    ) -> "CNNLSTMForecaster":
+        params = dict(model_config.params)
+        forecaster = super().from_config(
+            ModelSpecConfig(
+                name="lstm",
+                random_state=model_config.random_state,
+                params=params,
+                scale_features=model_config.scale_features,
+                scale_target=model_config.scale_target,
+            ),
+            scale_config,
+        )
+        forecaster.cnn_channels = int(params.pop("cnn_channels", 32))
+        forecaster.cnn_kernel_size = int(params.pop("cnn_kernel_size", 5))
+        forecaster.cnn_layers = int(params.pop("cnn_layers", 1))
+        return forecaster
+
+    def _build_network(
+        self,
+        history_numeric_size: int,
+        future_numeric_size: int,
+        categorical_cardinalities: list[int],
+        embedding_dims: list[int],
+    ) -> Any:
+        return _CNNLSTMMDNNet.build(
+            history_numeric_size=history_numeric_size,
+            future_numeric_size=future_numeric_size,
+            categorical_cardinalities=categorical_cardinalities,
+            embedding_dims=embedding_dims,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            n_components=self.n_components,
+            min_std=self.min_std,
+            bidirectional=self.bidirectional,
+            use_point_head=self.use_point_head,
+            cnn_channels=self.cnn_channels,
+            cnn_kernel_size=self.cnn_kernel_size,
+            cnn_layers=self.cnn_layers,
+        )
+
+    def training_log(self) -> dict[str, Any]:
+        log = super().training_log()
+        log["metadata"].update(
+            {
+                "cnn_channels": self.cnn_channels,
+                "cnn_kernel_size": self.cnn_kernel_size,
+                "cnn_layers": self.cnn_layers,
+            }
+        )
+        return log
+
+    def _model_type(self) -> str:
+        return "cnn_bilstm" if self.bidirectional else "cnn_lstm"
+
+    def _metadata(self) -> dict[str, Any]:
+        metadata = super()._metadata()
+        metadata.update(
+            {
+                "cnn_channels": self.cnn_channels,
+                "cnn_kernel_size": self.cnn_kernel_size,
+                "cnn_layers": self.cnn_layers,
+            }
+        )
+        return metadata
+
+
+@dataclass
+class CNNLSTMAttentionForecaster(CNNLSTMForecaster):
+    """CNN+LSTM forecaster with anchor temporal attention over encoded history."""
+
+    attention_hidden_size: int | None = None
+    attention_recent_steps: int = 32
+    attention_anchor_periods: tuple[int, ...] = (96, 192, 672)
+    attention_anchor_window: int = 4
+
+    @classmethod
+    def from_config(
+        cls,
+        model_config: ModelSpecConfig,
+        scale_config: ForecastProfileConfig,
+    ) -> "CNNLSTMAttentionForecaster":
+        params = dict(model_config.params)
+        forecaster = super().from_config(
+            ModelSpecConfig(
+                name="cnn_lstm",
+                random_state=model_config.random_state,
+                params=params,
+                scale_features=model_config.scale_features,
+                scale_target=model_config.scale_target,
+            ),
+            scale_config,
+        )
+        attention_hidden_size = params.pop("attention_hidden_size", None)
+        forecaster.attention_hidden_size = (
+            None if attention_hidden_size is None else int(attention_hidden_size)
+        )
+        forecaster.attention_recent_steps = int(params.pop("attention_recent_steps", 32))
+        forecaster.attention_anchor_periods = tuple(
+            int(period) for period in params.pop("attention_anchor_periods", (96, 192, 672))
+        )
+        forecaster.attention_anchor_window = int(params.pop("attention_anchor_window", 4))
+        return forecaster
+
+    def _build_network(
+        self,
+        history_numeric_size: int,
+        future_numeric_size: int,
+        categorical_cardinalities: list[int],
+        embedding_dims: list[int],
+    ) -> Any:
+        return _CNNLSTMAttentionMDNNet.build(
+            history_numeric_size=history_numeric_size,
+            future_numeric_size=future_numeric_size,
+            categorical_cardinalities=categorical_cardinalities,
+            embedding_dims=embedding_dims,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            n_components=self.n_components,
+            min_std=self.min_std,
+            bidirectional=self.bidirectional,
+            use_point_head=self.use_point_head,
+            cnn_channels=self.cnn_channels,
+            cnn_kernel_size=self.cnn_kernel_size,
+            cnn_layers=self.cnn_layers,
+            attention_hidden_size=self.attention_hidden_size,
+            attention_recent_steps=self.attention_recent_steps,
+            attention_anchor_periods=self.attention_anchor_periods,
+            attention_anchor_window=self.attention_anchor_window,
+        )
+
+    def training_log(self) -> dict[str, Any]:
+        log = super().training_log()
+        log["metadata"].update(
+            {
+                "attention_hidden_size": self.attention_hidden_size,
+                "attention_recent_steps": self.attention_recent_steps,
+                "attention_anchor_periods": self.attention_anchor_periods,
+                "attention_anchor_window": self.attention_anchor_window,
+            }
+        )
+        return log
+
+    def _model_type(self) -> str:
+        return "cnn_bilstm_attention" if self.bidirectional else "cnn_lstm_attention"
+
+    def _metadata(self) -> dict[str, Any]:
+        metadata = super()._metadata()
+        metadata.update(
+            {
+                "attention_hidden_size": self.attention_hidden_size,
+                "attention_recent_steps": self.attention_recent_steps,
+                "attention_anchor_periods": self.attention_anchor_periods,
+                "attention_anchor_window": self.attention_anchor_window,
+            }
+        )
+        return metadata
 
 
 def _erf(value: float) -> float:

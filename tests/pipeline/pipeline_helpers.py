@@ -7,16 +7,23 @@ from pathlib import Path
 import pandas as pd
 
 from load_prediction.configs import (
+    FeatureEngineeringConfig,
     ModelSpecConfig,
     ArtifactConfig,
+    ForecastProfileConfig,
     PipelineConfig,
 )
 from load_prediction.data import CSVLoadDataLoader
 from load_prediction.models.base_forecaster import ForecastFrame
 from load_prediction.models.gmm_forecaster import GMMForecaster
-from load_prediction.models.lstm_forecaster import LSTMForecaster
+from load_prediction.models.lstm_forecaster import (
+    CNNLSTMAttentionForecaster,
+    CNNLSTMForecaster,
+    LSTMForecaster,
+)
 from load_prediction.models.mdn_forecaster import MDNForecaster
 from load_prediction.models.parameter_tuning import TuningConfig, tune_pipeline
+from load_prediction.models.vmd_lightgbm_forecaster import VMDLightGBMForecaster
 from load_prediction.pipeline import LoadForecastPipeline
 
 DEFAULT_CONFIG = Path("configs/day_ahead.yaml")
@@ -92,6 +99,36 @@ def _with_model(config: PipelineConfig, model: ModelSpecConfig) -> PipelineConfi
         evaluation=config.evaluation,
         postprocess=config.postprocess,
         output=config.output,
+        scale=config.scale,
+    )
+
+
+def _with_scale_feature(config: PipelineConfig, feature: FeatureEngineeringConfig) -> PipelineConfig:
+    return PipelineConfig(
+        data=config.data,
+        cleaning=config.cleaning,
+        model=config.model,
+        evaluation=config.evaluation,
+        postprocess=config.postprocess,
+        output=config.output,
+        scale=ForecastProfileConfig(
+            name=config.scale.name,
+            freq=config.scale.freq,
+            prediction_length=config.scale.prediction_length,
+            feature=feature,
+            description=config.scale.description,
+        ),
+    )
+
+
+def _with_output_run_name(config: PipelineConfig, run_name: str) -> PipelineConfig:
+    return PipelineConfig(
+        data=config.data,
+        cleaning=config.cleaning,
+        model=config.model,
+        evaluation=config.evaluation,
+        postprocess=config.postprocess,
+        output=ArtifactConfig(**{**config.output.__dict__, "run_name": run_name}),
         scale=config.scale,
     )
 
@@ -357,6 +394,50 @@ def run_lightgbm_pipeline():
     assert (result.forecast.frame["prediction"] >= 0).all()
 
 
+def run_lightgbm_similar_time_pipeline():
+    config = _lightgbm_similar_time_config()
+    data = _load_data(config)
+
+    pipeline = LoadForecastPipeline(config)
+    result = pipeline.run(data)
+
+    _assert_day_ahead_run_outputs(result, "lightgbm", run_name="similar_time")
+    _assert_basic_forecast_result(result, config.scale.prediction_length)
+    _assert_quantile_forecast_columns(result.forecast.frame)
+    _assert_distribution_grid(result.forecast.frame)
+    assert (result.forecast.frame["prediction"] >= 0).all()
+    feature_builder = pipeline.model.feature_builder
+    assert feature_builder.similar_time_builder_ is not None
+    assert any(
+        column.startswith("feature__similar_time__")
+        for column in feature_builder.feature_columns_
+    )
+
+
+def _lightgbm_similar_time_config() -> PipelineConfig:
+    config = _with_time_range(_day_ahead_config())
+    feature = FeatureEngineeringConfig(
+        **{
+            **config.scale.feature.__dict__,
+            "add_similar_time_features": True,
+            "similar_time_top_k": 5,
+            "similar_time_candidate_lookback": 96 * 90,
+            "similar_time_slot_tolerance_steps": 1,
+            "similar_time_lag_steps": (96, 192, 672),
+            "similar_time_rolling_windows": (96, 672),
+            "similar_time_weather_weight": 1.0,
+            "similar_time_calendar_weight": 1.0,
+            "similar_time_lag_weight": 1.0,
+            "similar_time_rolling_weight": 1.0,
+            "similar_time_restrict_weekend": False,
+            "similar_time_restrict_holiday": False,
+            "similar_time_restrict_extreme_weather": False,
+            "similar_time_candidate_recent_days": None,
+        }
+    )
+    return _with_output_run_name(_with_scale_feature(config, feature), "similar_time")
+
+
 def run_lightgbm_pipeline_with_parameter_tuning(
     enable_parameter_tuning: bool = False,
     n_trials: int = 2,
@@ -368,6 +449,62 @@ def run_lightgbm_pipeline_with_parameter_tuning(
         enable_parameter_tuning=enable_parameter_tuning,
         n_trials=n_trials,
         save_trial_outputs=save_trial_outputs,
+    )
+
+
+def run_vmd_lightgbm_pipeline():
+    config = _vmd_lightgbm_config()
+    data = _load_data(config)
+
+    pipeline = LoadForecastPipeline(config)
+    result = pipeline.run(data)
+
+    _assert_day_ahead_run_outputs(result, "vmd_lightgbm")
+    assert isinstance(pipeline.model, VMDLightGBMForecaster)
+    _assert_basic_forecast_result(result, config.scale.prediction_length)
+    _assert_quantile_forecast_columns(result.forecast.frame)
+    _assert_distribution_grid(result.forecast.frame)
+    assert (result.forecast.frame["prediction"] >= 0).all()
+
+
+def _vmd_lightgbm_config() -> PipelineConfig:
+    base_config = _with_time_range(_day_ahead_config())
+    return _with_model(
+        base_config,
+        ModelSpecConfig(
+            name="vmd_lightgbm",
+            random_state=42,
+            scale_features=False,
+            scale_target=False,
+            params={
+                "num_modes": 4,
+                "alpha": 2000.0,
+                "max_iter": 120,
+                "tolerance": 1e-5,
+                "n_estimators": 300,
+                "learning_rate": 0.05,
+                "objective": "regression_l1",
+                "num_leaves": 31,
+                "n_jobs": 1,
+                "verbosity": -1,
+                "enable_quantiles": True,
+                "lower_quantile": 0.1,
+                "upper_quantile": 0.9,
+                "quantile_levels": [
+                    0.05,
+                    0.1,
+                    0.2,
+                    0.3,
+                    0.4,
+                    0.5,
+                    0.6,
+                    0.7,
+                    0.8,
+                    0.9,
+                    0.95,
+                ],
+            },
+        ),
     )
 
 
@@ -764,6 +901,126 @@ def run_lstm_pipeline_with_parameter_tuning(
     )
 
 
+def run_cnn_lstm_pipeline():
+    config = _cnn_lstm_config()
+    data = _load_data(config)
+
+    pipeline = LoadForecastPipeline(config)
+    result = pipeline.run(data)
+
+    _assert_day_ahead_run_outputs(result, "cnn_lstm")
+    assert isinstance(pipeline.model, CNNLSTMForecaster)
+    _assert_basic_forecast_result(result, config.scale.prediction_length)
+    assert {
+        "0.1",
+        "0.9",
+        "prediction_lower",
+        "prediction_upper",
+        "prediction_density",
+        "lstm_weights",
+        "lstm_means",
+        "lstm_stds",
+        "distribution_values",
+        "distribution_probabilities",
+    }.issubset(result.forecast.frame.columns)
+    assert pipeline.model.cnn_channels == 32
+    assert pipeline.model.cnn_kernel_size == 5
+    loaded = CNNLSTMForecaster.load(result.model_path, device="cpu")
+    assert loaded.fitted_ is True
+    assert loaded.cnn_channels == 32
+    assert loaded.cnn_kernel_size == 5
+
+
+def _cnn_lstm_config() -> PipelineConfig:
+    base_config = _with_time_range(_day_ahead_config())
+    return _with_model(
+        base_config,
+        ModelSpecConfig(
+            name="cnn_lstm",
+            random_state=42,
+            params={
+                "context_length": 672,
+                "hidden_size": 64,
+                "num_layers": 1,
+                "dropout": 0.1,
+                "epochs": 50,
+                "batch_size": 128,
+                "learning_rate": 0.001,
+                "weight_decay": 0.0,
+                "max_train_samples": 8192,
+                "train_sample_strategy": "last",
+                "device": "cpu",
+                "validation_fraction": 0.1,
+                "early_stopping_patience": 5,
+                "early_stopping_min_delta": 1e-4,
+                "use_point_head": False,
+                "nll_loss_weight": 1.0,
+                "point_loss_weight": 0.0,
+                "cnn_channels": 32,
+                "cnn_kernel_size": 5,
+                "cnn_layers": 1,
+            },
+        ),
+    )
+
+
+def run_cnn_lstm_attention_pipeline():
+    config = _cnn_lstm_attention_config()
+    data = _load_data(config)
+
+    pipeline = LoadForecastPipeline(config)
+    result = pipeline.run(data)
+
+    _assert_day_ahead_run_outputs(result, "cnn_lstm_attention")
+    assert isinstance(pipeline.model, CNNLSTMAttentionForecaster)
+    _assert_basic_forecast_result(result, config.scale.prediction_length)
+    assert {
+        "0.1",
+        "0.9",
+        "prediction_lower",
+        "prediction_upper",
+        "prediction_density",
+        "lstm_weights",
+        "lstm_means",
+        "lstm_stds",
+        "distribution_values",
+        "distribution_probabilities",
+    }.issubset(result.forecast.frame.columns)
+    assert pipeline.model.cnn_channels == 32
+    assert pipeline.model.cnn_kernel_size == 5
+    assert pipeline.model.attention_hidden_size == 64
+    assert pipeline.model.attention_recent_steps == 32
+    assert pipeline.model.attention_anchor_periods == (96, 192, 672)
+    assert pipeline.model.attention_anchor_window == 4
+    loaded = CNNLSTMAttentionForecaster.load(result.model_path, device="cpu")
+    assert loaded.fitted_ is True
+    assert loaded.cnn_channels == 32
+    assert loaded.cnn_kernel_size == 5
+    assert loaded.attention_hidden_size == 64
+    assert loaded.attention_recent_steps == 32
+    assert loaded.attention_anchor_periods == (96, 192, 672)
+    assert loaded.attention_anchor_window == 4
+
+
+def _cnn_lstm_attention_config() -> PipelineConfig:
+    config = _cnn_lstm_config()
+    params = dict(config.model.params)
+    params["attention_hidden_size"] = 64
+    params["attention_recent_steps"] = 32
+    params["attention_anchor_periods"] = (96, 192, 672)
+    params["attention_anchor_window"] = 4
+    return _with_model(
+        config,
+        ModelSpecConfig(
+            name="cnn_lstm_attention",
+            random_state=config.model.random_state,
+            scale_features=config.model.scale_features,
+            scale_target=config.model.scale_target,
+            params=params,
+        ),
+    )
+
+
 def _lstm_config() -> PipelineConfig:
     base_config = _with_time_range(_day_ahead_config())
     return _with_model(
@@ -780,7 +1037,7 @@ def _lstm_config() -> PipelineConfig:
                 "batch_size": 128,
                 "learning_rate": 0.001,
                 "weight_decay": 0.0,
-                "max_train_samples": 4096,
+                "max_train_samples": 8192,
                 "train_sample_strategy": "last",
                 "device": "cpu",
                 "validation_fraction": 0.1,

@@ -5,12 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 
-import numpy as np
 import pandas as pd
 
 from load_prediction.configs import FeatureEngineeringConfig
 from load_prediction.data.data_schema import TimeSeriesDataset
+from load_prediction.features.calendar_features import (
+    build_calendar_feature_frame,
+    build_calendar_features,
+)
 from load_prediction.features.feature_registry import resolve_external_feature_columns
+from load_prediction.features.history_features import build_history_feature_frame, build_history_features
+from load_prediction.features.item_features import build_item_feature_frame, build_item_features
+from load_prediction.features.similar_time_features import (
+    SIMILAR_TIME_FEATURE_COLUMNS,
+    SimilarTimeFeatureBuilder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +39,7 @@ class FeatureBuilder:
     covariate_names_: tuple[str, ...] = ()
     numeric_covariates_: tuple[str, ...] = ()
     categorical_covariates_: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    similar_time_builder_: SimilarTimeFeatureBuilder | None = None
 
     def fit_transform(self, data: TimeSeriesDataset) -> tuple[pd.DataFrame, pd.Series]:
         logger.info(
@@ -42,8 +52,32 @@ class FeatureBuilder:
         self.covariate_names_ = ()
         self.numeric_covariates_ = ()
         self.categorical_covariates_ = {}
+        self.similar_time_builder_ = None
         self._fit_covariate_types(data.frame)
         frame = self._build_lagged_frame(data.frame, data)
+        if self.config.add_similar_time_features:
+            self.similar_time_builder_ = SimilarTimeFeatureBuilder(
+                top_k=self.config.similar_time_top_k,
+                lag_steps=self.config.similar_time_lag_steps,
+                rolling_windows=self.config.similar_time_rolling_windows,
+                weather_weight=self.config.similar_time_weather_weight,
+                calendar_weight=self.config.similar_time_calendar_weight,
+                lag_weight=self.config.similar_time_lag_weight,
+                rolling_weight=self.config.similar_time_rolling_weight,
+                candidate_lookback=self.config.similar_time_candidate_lookback,
+                slot_tolerance_steps=self.config.similar_time_slot_tolerance_steps,
+                restrict_weekend=self.config.similar_time_restrict_weekend,
+                restrict_holiday=self.config.similar_time_restrict_holiday,
+                restrict_extreme_weather=self.config.similar_time_restrict_extreme_weather,
+                candidate_recent_days=self.config.similar_time_candidate_recent_days,
+            )
+            frame = self.similar_time_builder_.fit_transform(
+                frame,
+                timestamp_col=data.timestamp_col,
+                item_id_col=data.item_id_col,
+                target_col=data.target_col,
+                numeric_covariates=self.numeric_covariates_,
+            )
         frame = frame.dropna(subset=[data.target_col])
 
         feature_columns = [col for col in frame.columns if col.startswith("feature__")]
@@ -85,21 +119,63 @@ class FeatureBuilder:
             raise RuntimeError("FeatureBuilder must be fitted before transform_future_row")
 
         row: dict[str, float] = {}
-        row.update(self._calendar_features(pd.Timestamp(timestamp)))
-        row.update(self._item_features(str(item_id)))
+        row.update(
+            build_calendar_features(
+                pd.Timestamp(timestamp),
+                add_calendar=self.config.add_calendar,
+                add_cyclical_time=self.config.add_cyclical_time,
+                add_chinese_calendar=self.config.add_chinese_calendar,
+            )
+        )
+        row.update(
+            build_item_features(
+                str(item_id),
+                self.item_ids_,
+                enabled=self.config.add_item_id,
+            )
+        )
         row.update(self._known_covariate_features(known_covariates or {}))
-        row.update(self._history_features(history, data.target_col))
+        row.update(
+            build_history_features(
+                history,
+                data.target_col,
+                lag_steps=self.config.lag_steps,
+                rolling_windows=self.config.rolling_windows,
+            )
+        )
+        row.update(
+            self._similar_time_features(
+                history=history,
+                data=data,
+                timestamp=pd.Timestamp(timestamp),
+                item_id=str(item_id),
+                known_covariates=known_covariates or {},
+            )
+        )
         return pd.DataFrame([{col: row.get(col, 0.0) for col in self.selected_columns_}])
 
     def _build_lagged_frame(self, frame: pd.DataFrame, data: TimeSeriesDataset) -> pd.DataFrame:
         parts: list[pd.DataFrame] = []
         for item_id, group in frame.groupby(data.item_id_col, sort=False):
             item = group.sort_values(data.timestamp_col).copy()
-            item_features = self._calendar_feature_frame(pd.to_datetime(item[data.timestamp_col]))
-
-            if self.config.add_item_id:
-                for known_item in self.item_ids_:
-                    item_features[f"feature__item__{known_item}"] = float(str(item_id) == known_item)
+            item_features = build_calendar_feature_frame(
+                pd.to_datetime(item[data.timestamp_col]),
+                add_calendar=self.config.add_calendar,
+                add_cyclical_time=self.config.add_cyclical_time,
+                add_chinese_calendar=self.config.add_chinese_calendar,
+            )
+            item_features = pd.concat(
+                [
+                    item_features,
+                    build_item_feature_frame(
+                        str(item_id),
+                        self.item_ids_,
+                        length=len(item),
+                        enabled=self.config.add_item_id,
+                    ),
+                ],
+                axis=1,
+            )
 
             covariates = resolve_external_feature_columns(
                 item,
@@ -121,14 +197,17 @@ class FeatureBuilder:
                         ] = (normalized == category).astype(float).to_numpy()
 
             target = pd.to_numeric(item[data.target_col], errors="coerce")
-            for lag in self.config.lag_steps:
-                item_features[f"feature__lag__{lag}"] = target.shift(lag)
-            for window in self.config.rolling_windows:
-                shifted = target.shift(1)
-                item_features[f"feature__rolling_mean__{window}"] = shifted.rolling(window).mean()
-                item_features[f"feature__rolling_std__{window}"] = (
-                    shifted.rolling(window).std().fillna(0)
-                )
+            item_features = pd.concat(
+                [
+                    item_features,
+                    build_history_feature_frame(
+                        target,
+                        lag_steps=self.config.lag_steps,
+                        rolling_windows=self.config.rolling_windows,
+                    ),
+                ],
+                axis=1,
+            )
 
             item_features[data.target_col] = target.to_numpy()
             item_features[data.timestamp_col] = item[data.timestamp_col].to_numpy()
@@ -137,70 +216,29 @@ class FeatureBuilder:
 
         return pd.concat(parts, ignore_index=True)
 
-    def _calendar_feature_frame(self, timestamps: pd.Series) -> pd.DataFrame:
-        ts = pd.to_datetime(timestamps)
-        features = pd.DataFrame(index=range(len(ts)))
-        if not self.config.add_calendar:
-            return features
-
-        features["feature__calendar__dayofweek"] = ts.dt.dayofweek.to_numpy()
-        features["feature__calendar__is_weekend"] = (ts.dt.dayofweek >= 5).astype(int).to_numpy()
-        features["feature__calendar__year"] = ts.dt.year.to_numpy()
-        features["feature__calendar__month"] = ts.dt.month.to_numpy()
-        features["feature__calendar__day"] = ts.dt.day.to_numpy()
-        features["feature__calendar__quarter"] = ts.dt.quarter.to_numpy()
-        features["feature__calendar__dayofyear"] = ts.dt.dayofyear.to_numpy()
-        features["feature__calendar__hour"] = ts.dt.hour.to_numpy()
-        features["feature__calendar__minute"] = ts.dt.minute.to_numpy()
-
-        if self.config.add_cyclical_time:
-            minute_of_day = ts.dt.hour.to_numpy() * 60 + ts.dt.minute.to_numpy()
-            features["feature__time__sin_day"] = np.sin(2 * np.pi * minute_of_day / 1440)
-            features["feature__time__cos_day"] = np.cos(2 * np.pi * minute_of_day / 1440)
-            features["feature__time__sin_week"] = np.sin(
-                2 * np.pi * (ts.dt.dayofweek.to_numpy() * 1440 + minute_of_day) / (7 * 1440)
-            )
-            features["feature__time__cos_week"] = np.cos(
-                2 * np.pi * (ts.dt.dayofweek.to_numpy() * 1440 + minute_of_day) / (7 * 1440)
-            )
-
-        return features
-
-    def _calendar_features(self, timestamp: pd.Timestamp) -> dict[str, float]:
-        if not self.config.add_calendar:
+    def _similar_time_features(
+        self,
+        *,
+        history: pd.DataFrame,
+        data: TimeSeriesDataset,
+        timestamp: pd.Timestamp,
+        item_id: str,
+        known_covariates: dict[str, object],
+    ) -> dict[str, float]:
+        if not self.config.add_similar_time_features:
             return {}
-
-        minute_of_day = timestamp.hour * 60 + timestamp.minute
-        features = {
-            "feature__calendar__dayofweek": float(timestamp.dayofweek),
-            "feature__calendar__is_weekend": float(timestamp.dayofweek >= 5),
-            "feature__calendar__year": float(timestamp.year),
-            "feature__calendar__month": float(timestamp.month),
-            "feature__calendar__day": float(timestamp.day),
-            "feature__calendar__quarter": float(timestamp.quarter),
-            "feature__calendar__dayofyear": float(timestamp.dayofyear),
-            "feature__calendar__hour": float(timestamp.hour),
-            "feature__calendar__minute": float(timestamp.minute),
-        }
-        if self.config.add_cyclical_time:
-            features.update(
-                {
-                    "feature__time__sin_day": float(np.sin(2 * np.pi * minute_of_day / 1440)),
-                    "feature__time__cos_day": float(np.cos(2 * np.pi * minute_of_day / 1440)),
-                    "feature__time__sin_week": float(
-                        np.sin(2 * np.pi * (timestamp.dayofweek * 1440 + minute_of_day) / (7 * 1440))
-                    ),
-                    "feature__time__cos_week": float(
-                        np.cos(2 * np.pi * (timestamp.dayofweek * 1440 + minute_of_day) / (7 * 1440))
-                    ),
-                }
-            )
-        return features
-
-    def _item_features(self, item_id: str) -> dict[str, float]:
-        if not self.config.add_item_id:
-            return {}
-        return {f"feature__item__{known_item}": float(item_id == known_item) for known_item in self.item_ids_}
+        if self.similar_time_builder_ is None:
+            return {column: 0.0 for column in SIMILAR_TIME_FEATURE_COLUMNS}
+        return self.similar_time_builder_.transform_future_row(
+            history,
+            timestamp=timestamp,
+            item_id=item_id,
+            timestamp_col=data.timestamp_col,
+            item_id_col=data.item_id_col,
+            target_col=data.target_col,
+            numeric_covariates=self.numeric_covariates_,
+            known_covariates=known_covariates,
+        )
 
     def _known_covariate_features(self, known_covariates: dict[str, object]) -> dict[str, float]:
         features = {
@@ -248,21 +286,6 @@ class FeatureBuilder:
             self.numeric_covariates_,
             {name: len(categories) for name, categories in self.categorical_covariates_.items()},
         )
-
-    def _history_features(self, history: pd.DataFrame, target_col: str) -> dict[str, float]:
-        target = pd.to_numeric(history[target_col], errors="coerce").dropna()
-        features: dict[str, float] = {}
-        for lag in self.config.lag_steps:
-            features[f"feature__lag__{lag}"] = float(target.iloc[-lag]) if len(target) >= lag else 0.0
-        for window in self.config.rolling_windows:
-            window_values = target.iloc[-window:]
-            features[f"feature__rolling_mean__{window}"] = (
-                float(window_values.mean()) if not window_values.empty else 0.0
-            )
-            features[f"feature__rolling_std__{window}"] = (
-                float(window_values.std(ddof=1)) if len(window_values) > 1 else 0.0
-            )
-        return features
 
     def _select_by_correlation(
         self,

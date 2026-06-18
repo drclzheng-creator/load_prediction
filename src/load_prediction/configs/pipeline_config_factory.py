@@ -79,7 +79,14 @@ def _data_source_config(raw: dict[str, Any]) -> DataSourceConfig:
 
 def _feature_config(raw: dict[str, Any]) -> FeatureEngineeringConfig:
     values = dict(raw)
-    for key in ("lag_steps", "rolling_windows", "known_covariates", "external_feature_sets"):
+    for key in (
+        "lag_steps",
+        "rolling_windows",
+        "known_covariates",
+        "external_feature_sets",
+        "similar_time_lag_steps",
+        "similar_time_rolling_windows",
+    ):
         if key in values:
             values[key] = tuple(values[key] or ())
     return FeatureEngineeringConfig(**values)
@@ -112,4 +119,3 @@ def _forecast_postprocessing_config(raw: dict[str, Any]) -> ForecastPostprocessi
     if distribution_grid_values:
         values["distribution_grid"] = DistributionGridConfig(**distribution_grid_values)
     return ForecastPostprocessingConfig(**values)
-
