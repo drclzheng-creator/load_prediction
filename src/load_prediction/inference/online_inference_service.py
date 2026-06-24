@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ import joblib
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
 
-from load_prediction.configs import ForecastPostprocessingConfig
+from load_prediction.configs import DistributionGridConfig, ForecastPostprocessingConfig
 from load_prediction.data.data_schema import TimeSeriesDataset
 from load_prediction.inference.model_manifest import ModelManifest, load_model_manifest
 from load_prediction.models.autogluon_forecaster import AutoGluonTimeSeriesForecaster
@@ -47,6 +48,66 @@ class OnlineInferenceResponse:
     prediction_length: int
     freq: str
     model_type: str
+
+
+def load_online_inference_request(path: str | Path) -> OnlineInferenceRequest:
+    """Load a serialized online inference request from JSON."""
+
+    request_path = Path(path)
+    values = json.loads(request_path.read_text(encoding="utf-8"))
+    if not isinstance(values, dict):
+        raise ValueError("Online inference request JSON must be an object")
+    return online_inference_request_from_dict(values)
+
+
+def online_inference_request_from_dict(values: dict[str, Any]) -> OnlineInferenceRequest:
+    """Build an online inference request from a JSON-compatible dictionary."""
+
+    payload = dict(values)
+    postprocess_values = payload.get("postprocess")
+    if postprocess_values is None:
+        postprocess = ForecastPostprocessingConfig()
+    elif isinstance(postprocess_values, ForecastPostprocessingConfig):
+        postprocess = postprocess_values
+    elif isinstance(postprocess_values, dict):
+        postprocess_payload = dict(postprocess_values)
+        distribution_grid_values = postprocess_payload.get("distribution_grid")
+        if isinstance(distribution_grid_values, dict):
+            postprocess_payload["distribution_grid"] = DistributionGridConfig(
+                **distribution_grid_values
+            )
+        postprocess = ForecastPostprocessingConfig(**postprocess_payload)
+    else:
+        raise ValueError("postprocess must be an object when provided")
+    payload["postprocess"] = postprocess
+    return OnlineInferenceRequest(**payload)
+
+
+def run_online_inference_from_json(
+    path: str | Path,
+    output_path: str | Path | None = None,
+) -> OnlineInferenceResponse:
+    """Load a prediction_request.json file and run one online forecast."""
+
+    response = run_online_inference(load_online_inference_request(path))
+    if output_path is not None:
+        save_online_inference_response(response, output_path)
+    return response
+
+
+def save_online_inference_response(
+    response: OnlineInferenceResponse,
+    path: str | Path,
+) -> Path:
+    """Save an online inference response as JSON."""
+
+    response_path = Path(path)
+    response_path.parent.mkdir(parents=True, exist_ok=True)
+    response_path.write_text(
+        json.dumps(asdict(response), ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return response_path
 
 
 def run_online_inference(request: OnlineInferenceRequest) -> OnlineInferenceResponse:

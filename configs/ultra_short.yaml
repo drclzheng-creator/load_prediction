@@ -24,6 +24,7 @@ cleaning:
 feature:
   add_calendar: true
   add_cyclical_time: true
+  add_chinese_calendar: true
   add_item_id: true
   lag_steps:
     - 1

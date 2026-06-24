@@ -11,7 +11,7 @@ class FeatureEngineeringConfig:
 
     add_calendar: bool = True
     add_cyclical_time: bool = True
-    add_chinese_calendar: bool = False
+    add_chinese_calendar: bool = True
     add_item_id: bool = True
     lag_steps: tuple[int, ...] = (1, 2, 3, 4, 24, 96)
     rolling_windows: tuple[int, ...] = (4, 12, 24)
