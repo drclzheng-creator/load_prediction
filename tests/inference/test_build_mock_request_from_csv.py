@@ -108,7 +108,6 @@ def test_build_mock_request_from_csv_generates_prediction_request_json(
     output_path = REQUEST_INPUT_DIR / f"{model_type}_{prediction_length}_{freq}_prediction_request.json"
     request_path = build_and_save_mock_request_from_csv(
         csv_path=DEFAULT_INPUT_CSV,
-        model_path=model_path,
         output_path=output_path,
         config_path=config_path,
         model_type=model_type,
@@ -121,17 +120,24 @@ def test_build_mock_request_from_csv_generates_prediction_request_json(
     assert request_path == output_path
     assert request_path.exists()
     values = json.loads(request_path.read_text(encoding="utf-8"))
-    assert values["model_type"] == model_type
-    assert values["model_path"] == str(model_path)
-    assert values["prediction_length"] == prediction_length
-    assert values["freq"] == freq
-    assert len(values["history"]) == history_length
-    assert len(values["known_covariates"]) == prediction_length
-    assert DEFAULT_KNOWN_COVARIATES.issubset(values["history"][0])
-    assert DEFAULT_KNOWN_COVARIATES.issubset(values["known_covariates"][0])
-    assert "target" in values["history"][0]
-    assert "target" not in values["known_covariates"][0]
+    assert values["task"]["prediction_length"] == prediction_length
+    assert values["task"]["freq"] == freq
+    assert values["task"]["task_type"] == "load_forecast"
+    assert values["request_id"]
+    assert values["request_time"]
+    assert len(values["history_load"]) == history_length
+    assert len(values["future_covariates"]) == prediction_length
+    assert DEFAULT_KNOWN_COVARIATES.issubset(values["history_load"][0])
+    assert DEFAULT_KNOWN_COVARIATES.issubset(values["future_covariates"][0])
+    assert "actual_load" in values["history_load"][0]
+    assert "target" not in values["history_load"][0]
+    assert "target" not in values["future_covariates"][0]
+    assert "item_id" not in values["history_load"][0]
+    assert "item_id" not in values["future_covariates"][0]
+    assert values["trace"]["schema_version"] == "load_forecast.v2"
+    assert "model_hint" not in values["trace"]
 
     request = load_online_inference_request(request_path)
-    assert request.model_type == model_type
-    assert request.prediction_length == prediction_length
+    assert request.item_id
+    assert request.task.forecast_scale == values["task"]["forecast_scale"]
+    assert request.task.prediction_length == prediction_length

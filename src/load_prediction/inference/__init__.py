@@ -1,6 +1,7 @@
 from load_prediction.inference.online_inference_service import (
     OnlineInferenceRequest,
     OnlineInferenceResponse,
+    OnlineInferenceTask,
     load_forecast_model,
     load_online_inference_request,
     normalize_forecast_frame,
@@ -8,12 +9,15 @@ from load_prediction.inference.online_inference_service import (
     run_online_inference_from_json,
     run_online_inference,
     save_online_inference_response,
+    validate_model_compatibility,
+    validate_request_schema,
     validate_online_request,
 )
 
 __all__ = [
     "OnlineInferenceRequest",
     "OnlineInferenceResponse",
+    "OnlineInferenceTask",
     "load_forecast_model",
     "load_online_inference_request",
     "normalize_forecast_frame",
@@ -21,5 +25,7 @@ __all__ = [
     "run_online_inference_from_json",
     "run_online_inference",
     "save_online_inference_response",
+    "validate_model_compatibility",
+    "validate_request_schema",
     "validate_online_request",
 ]

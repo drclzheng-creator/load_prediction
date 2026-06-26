@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 import joblib
 import pandas as pd
@@ -20,24 +23,34 @@ from load_prediction.models.base_forecaster import BaseForecastModel, ForecastFr
 from load_prediction.models.lstm_forecaster import LSTMForecaster
 from load_prediction.models.mdn_forecaster import MDNForecaster
 from load_prediction.postprocessing import ForecastPostProcessor
+from load_prediction.preprocessing import TimeSeriesCleaner
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class OnlineInferenceTask:
+    """Task configuration in the online inference request."""
+
+    task_type: str = "load_forecast"
+    forecast_type: str = "point"
+    forecast_scale: str | None = None
+    prediction_length: int = 96
+    freq: str = "15min"
 
 
 @dataclass(frozen=True)
 class OnlineInferenceRequest:
     """Serializable request shape for one online forecast call."""
 
-    model_path: str
-    model_type: str = "joblib"
-    history: list[dict[str, Any]] = field(default_factory=list)
-    known_covariates: list[dict[str, Any]] = field(default_factory=list)
-    prediction_length: int = 96
-    freq: str = "15min"
-    timestamp_col: str = "timestamp"
-    target_col: str = "target"
-    item_id_col: str = "item_id"
-    postprocess: ForecastPostprocessingConfig = field(default_factory=ForecastPostprocessingConfig)
+    request_id: str | None = None
+    request_time: str | None = None
+    item_id: str = ""
+    task: OnlineInferenceTask = field(default_factory=OnlineInferenceTask)
+    history_load: list[dict[str, Any]] = field(default_factory=list)
+    future_covariates: list[dict[str, Any]] = field(default_factory=list)
+    forecast_options: dict[str, Any] = field(default_factory=dict)
+    trace: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -48,6 +61,19 @@ class OnlineInferenceResponse:
     prediction_length: int
     freq: str
     model_type: str
+    item_id: str | None = None
+    request_id: str | None = None
+    response_id: str | None = None
+    model_version: str | None = None
+    model_name: str | None = None
+    scale_name: str | None = None
+    response_time: str | None = None
+    task_status: str = "COMPLETED"
+    task_type: str = "load_forecast"
+    forecast_type: str = "point"
+    forecast_scale: str | None = None
+    model_inference_time_ms: float | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 def load_online_inference_request(path: str | Path) -> OnlineInferenceRequest:
@@ -63,33 +89,76 @@ def load_online_inference_request(path: str | Path) -> OnlineInferenceRequest:
 def online_inference_request_from_dict(values: dict[str, Any]) -> OnlineInferenceRequest:
     """Build an online inference request from a JSON-compatible dictionary."""
 
-    payload = dict(values)
-    postprocess_values = payload.get("postprocess")
-    if postprocess_values is None:
-        postprocess = ForecastPostprocessingConfig()
-    elif isinstance(postprocess_values, ForecastPostprocessingConfig):
-        postprocess = postprocess_values
-    elif isinstance(postprocess_values, dict):
-        postprocess_payload = dict(postprocess_values)
-        distribution_grid_values = postprocess_payload.get("distribution_grid")
-        if isinstance(distribution_grid_values, dict):
-            postprocess_payload["distribution_grid"] = DistributionGridConfig(
-                **distribution_grid_values
-            )
-        postprocess = ForecastPostprocessingConfig(**postprocess_payload)
-    else:
-        raise ValueError("postprocess must be an object when provided")
-    payload["postprocess"] = postprocess
-    return OnlineInferenceRequest(**payload)
+    _reject_legacy_request_fields(values)
+    item_id = str(values.get("item_id") or "").strip()
+    if not item_id:
+        raise ValueError("item_id is required")
+
+    task_values = values.get("task") or {}
+    if not isinstance(task_values, dict):
+        raise ValueError("task must be an object")
+    forecast_options = values.get("forecast_options") or {}
+    trace = values.get("trace") or {}
+    history_load = values.get("history_load") or []
+    future_covariates = values.get("future_covariates") or []
+    if not isinstance(forecast_options, dict):
+        raise ValueError("forecast_options must be an object")
+    if not isinstance(trace, dict):
+        raise ValueError("trace must be an object")
+    if not isinstance(history_load, list):
+        raise ValueError("history_load must be an array")
+    if not isinstance(future_covariates, list):
+        raise ValueError("future_covariates must be an array")
+
+    request_time = values.get("request_time")
+    if request_time is not None:
+        request_time = str(request_time)
+
+    return OnlineInferenceRequest(
+        request_id=str(values.get("request_id") or "") or None,
+        request_time=request_time,
+        item_id=item_id,
+        task=_task_from_dict(task_values),
+        history_load=history_load,
+        future_covariates=future_covariates,
+        forecast_options=forecast_options,
+        trace=trace,
+    )
+
+
+def _task_from_dict(values: dict[str, Any]) -> OnlineInferenceTask:
+    return OnlineInferenceTask(
+        task_type=str(values.get("task_type") or "load_forecast"),
+        forecast_type=str(values.get("forecast_type") or "point"),
+        forecast_scale=str(values.get("forecast_scale") or "") or None,
+        prediction_length=int(values.get("prediction_length", 96)),
+        freq=str(values.get("freq", "15min")),
+    )
+
+
+def _reject_legacy_request_fields(values: dict[str, Any]) -> None:
+    legacy_fields = {
+        "model_path",
+        "history",
+        "known_covariates",
+        "timestamp_col",
+        "target_col",
+        "item_id_col",
+        "postprocess",
+    }
+    present = sorted(field for field in legacy_fields if field in values)
+    if present:
+        raise ValueError(f"Legacy request fields are not supported: {present}")
 
 
 def run_online_inference_from_json(
     path: str | Path,
+    model_path: str | Path,
     output_path: str | Path | None = None,
 ) -> OnlineInferenceResponse:
-    """Load a prediction_request.json file and run one online forecast."""
+    """Load a request JSON file and run one online forecast."""
 
-    response = run_online_inference(load_online_inference_request(path))
+    response = run_online_inference(load_online_inference_request(path), model_path=model_path)
     if output_path is not None:
         save_online_inference_response(response, output_path)
     return response
@@ -104,121 +173,128 @@ def save_online_inference_response(
     response_path = Path(path)
     response_path.parent.mkdir(parents=True, exist_ok=True)
     response_path.write_text(
-        json.dumps(asdict(response), ensure_ascii=False, indent=2, default=str),
+        json.dumps(_response_protocol_dict(response), ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
     return response_path
 
 
-def run_online_inference(request: OnlineInferenceRequest) -> OnlineInferenceResponse:
+def run_online_inference(
+    request: OnlineInferenceRequest,
+    model_path: str | Path,
+) -> OnlineInferenceResponse:
     """Load a saved model and run one online prediction request."""
 
-    if not request.history:
-        raise ValueError("Online inference request requires non-empty history records")
-    model = load_forecast_model(request.model_path, request.model_type)
-    manifest = load_model_manifest(request.model_path)
-    validate_online_request(request, manifest)
-    history = _dataset_from_records(
-        request.history,
-        timestamp_col=request.timestamp_col,
-        target_col=request.target_col,
-        item_id_col=request.item_id_col,
-        freq=request.freq,
-    )
-    known_covariates = _frame_from_records(request.known_covariates, request.timestamp_col)
+    if not request.history_load:
+        raise ValueError("Online inference request requires non-empty history_load records")
+
+    manifest = load_model_manifest(model_path)
+    model = load_forecast_model(model_path, manifest.model_type)
+    validate_request_schema(request)
+    validate_model_compatibility(request, manifest)
+
+    history = _dataset_from_records(request.history_load, item_id=request.item_id, freq=request.task.freq)
+    known_covariates = _frame_from_records(request.future_covariates, item_id=request.item_id)
+
+    inference_started = perf_counter()
     forecast = model.predict(
         history,
-        prediction_length=request.prediction_length,
-        freq=request.freq,
+        prediction_length=request.task.prediction_length,
+        freq=request.task.freq,
         known_covariates=known_covariates,
     )
     forecast = normalize_forecast_frame(forecast)
     residual_std = float(getattr(model, "residual_std_", 0.0))
-    forecast = ForecastPostProcessor(request.postprocess).transform(
+    forecast = ForecastPostProcessor(_postprocess_config_from_manifest(manifest)).transform(
         forecast,
         residual_std=residual_std,
     )
+    model_inference_time_ms = (perf_counter() - inference_started) * 1000.0
     response = OnlineInferenceResponse(
         forecast=_forecast_records(forecast),
-        prediction_length=request.prediction_length,
-        freq=request.freq,
-        model_type=request.model_type,
+        prediction_length=request.task.prediction_length,
+        freq=request.task.freq,
+        model_type=manifest.model_type,
+        item_id=request.item_id,
+        request_id=request.request_id,
+        response_id=request.request_id or str(uuid4()),
+        model_version=str(manifest.manifest_version),
+        model_name=manifest.model_name,
+        scale_name=manifest.scale_name,
+        response_time=datetime.now(timezone.utc).isoformat(),
+        task_type=request.task.task_type,
+        forecast_type=request.task.forecast_type,
+        forecast_scale=request.task.forecast_scale or manifest.scale_name,
+        model_inference_time_ms=model_inference_time_ms,
     )
     _log_online_response(response)
     return response
 
 
-def validate_online_request(
+def validate_request_schema(request: OnlineInferenceRequest) -> None:
+    """Validate request structure and required fields only."""
+
+    if not request.item_id:
+        raise ValueError("item_id is required")
+    if not request.history_load:
+        raise ValueError("Online inference request requires non-empty history_load records")
+
+    history_frame = pd.DataFrame(request.history_load)
+    known_frame = pd.DataFrame(request.future_covariates)
+    _require_columns(history_frame, ["timestamp", "actual_load"], "history_load")
+    if request.future_covariates:
+        _require_columns(known_frame, ["timestamp"], "future_covariates")
+        if "actual_load" in known_frame.columns:
+            raise ValueError("future_covariates must not contain actual_load")
+
+
+def validate_model_compatibility(
     request: OnlineInferenceRequest,
     manifest: ModelManifest,
 ) -> None:
-    """Validate online request shape before feature construction and prediction."""
+    """Validate request against model and manifest expectations."""
 
-    if not request.history:
-        raise ValueError("Online inference request requires non-empty history records")
-    history_frame = pd.DataFrame(request.history)
-    known_frame = pd.DataFrame(request.known_covariates)
-    _require_columns(
-        history_frame,
-        [request.timestamp_col, request.item_id_col, request.target_col],
-        "history",
-    )
-    if request.known_covariates:
-        _require_columns(
-            known_frame,
-            [request.timestamp_col, request.item_id_col],
-            "known_covariates",
-        )
-        if request.target_col in known_frame.columns:
-            logger.warning("known_covariates must not contain future target column")
-            raise ValueError("known_covariates must not contain future target column")
+    task = request.task
+    history_frame = pd.DataFrame(request.history_load)
+    known_frame = pd.DataFrame(request.future_covariates)
 
     errors: list[str] = []
-    if request.prediction_length != manifest.prediction_length:
+    if task.prediction_length != manifest.prediction_length:
         errors.append(
-            f"prediction_length mismatch request={request.prediction_length} manifest={manifest.prediction_length}"
+            f"prediction_length mismatch request={task.prediction_length} manifest={manifest.prediction_length}"
         )
-    if request.freq != manifest.freq:
-        errors.append(f"freq mismatch request={request.freq} manifest={manifest.freq}")
-    if request.timestamp_col != manifest.timestamp_col:
-        errors.append(
-            f"timestamp_col mismatch request={request.timestamp_col} manifest={manifest.timestamp_col}"
-        )
-    if request.target_col != manifest.target_col:
-        errors.append(f"target_col mismatch request={request.target_col} manifest={manifest.target_col}")
-    if request.item_id_col != manifest.item_id_col:
-        errors.append(f"item_id_col mismatch request={request.item_id_col} manifest={manifest.item_id_col}")
+    if task.freq != manifest.freq:
+        errors.append(f"freq mismatch request={task.freq} manifest={manifest.freq}")
 
-    errors.extend(_missing_columns(history_frame, manifest.required_history_columns, "history"))
-    errors.extend(_missing_required_values(history_frame, manifest.required_history_columns, "history"))
-    errors.extend(_negative_target_errors(history_frame, request, manifest))
+    errors.extend(_missing_columns(history_frame, manifest.required_history_columns, "history_load"))
+    errors.extend(_missing_required_values(history_frame, manifest.required_history_columns, "history_load"))
+    errors.extend(_negative_target_errors(history_frame, manifest))
     if len(history_frame) < manifest.required_history_length:
         errors.append(
-            f"history length={len(history_frame)} shorter than required_history_length={manifest.required_history_length}"
+            f"history_load length={len(history_frame)} shorter than required_history_length={manifest.required_history_length}"
         )
     if manifest.required_known_covariates:
         if known_frame.empty:
-            errors.append("known_covariates required by manifest but request provided none")
+            errors.append("future_covariates required by manifest but request provided none")
         else:
             errors.extend(
                 _missing_columns(
                     known_frame,
                     manifest.required_known_covariate_columns,
-                    "known_covariates",
+                    "future_covariates",
                 )
             )
             errors.extend(
                 _missing_required_values(
                     known_frame,
                     manifest.required_known_covariate_columns,
-                    "known_covariates",
+                    "future_covariates",
                 )
             )
-            if len(known_frame) < request.prediction_length:
+            if len(known_frame) < task.prediction_length:
                 errors.append(
-                    f"known_covariates length={len(known_frame)} shorter than prediction_length={request.prediction_length}"
+                    f"future_covariates length={len(known_frame)} shorter than prediction_length={task.prediction_length}"
                 )
-
     errors.extend(_validate_timeline(request, history_frame, known_frame))
     if errors:
         for error in errors:
@@ -226,10 +302,20 @@ def validate_online_request(
         raise ValueError("Invalid online inference request: " + "; ".join(errors))
     logger.info(
         "Online request validation passed model_type=%s prediction_length=%s required_known_covariates=%s",
-        request.model_type,
-        request.prediction_length,
+        manifest.model_type,
+        task.prediction_length,
         manifest.required_known_covariates,
     )
+
+
+def validate_online_request(
+    request: OnlineInferenceRequest,
+    manifest: ModelManifest,
+) -> None:
+    """Backward-compatible validation entrypoint."""
+
+    validate_request_schema(request)
+    validate_model_compatibility(request, manifest)
 
 
 def load_forecast_model(model_path: str | Path, model_type: str = "joblib") -> BaseForecastModel:
@@ -255,7 +341,6 @@ def load_forecast_model(model_path: str | Path, model_type: str = "joblib") -> B
 def _require_columns(frame: pd.DataFrame, columns: list[str], frame_name: str) -> None:
     missing = [column for column in columns if column not in frame.columns]
     if missing:
-        logger.warning("%s missing required columns=%s", frame_name, missing)
         raise ValueError(f"{frame_name} missing required columns: {missing}")
 
 
@@ -273,11 +358,7 @@ def _missing_required_values(
     if not present_columns:
         return []
     null_counts = frame[present_columns].isna().sum()
-    missing_counts = {
-        column: int(count)
-        for column, count in null_counts.items()
-        if int(count) > 0
-    }
+    missing_counts = {column: int(count) for column, count in null_counts.items() if int(count) > 0}
     if not missing_counts:
         return []
     return [f"{frame_name} contains null values in required columns={missing_counts}"]
@@ -285,15 +366,14 @@ def _missing_required_values(
 
 def _negative_target_errors(
     history_frame: pd.DataFrame,
-    request: OnlineInferenceRequest,
     manifest: ModelManifest,
 ) -> list[str]:
     contract = manifest.online_request_contract or {}
     if not contract.get("requires_non_negative_target", True):
         return []
-    if request.target_col not in history_frame.columns:
+    if "actual_load" not in history_frame.columns:
         return []
-    target = pd.to_numeric(history_frame[request.target_col], errors="coerce")
+    target = pd.to_numeric(history_frame["actual_load"], errors="coerce")
     negative_count = int((target < 0).sum())
     if negative_count == 0:
         return []
@@ -307,80 +387,61 @@ def _validate_timeline(
 ) -> list[str]:
     errors: list[str] = []
     history = history_frame.copy()
-    history[request.timestamp_col] = pd.to_datetime(history[request.timestamp_col])
-    history = history.sort_values([request.item_id_col, request.timestamp_col])
-    if history.duplicated([request.item_id_col, request.timestamp_col]).any():
-        errors.append("history contains duplicate item_id/timestamp rows")
-    inferred_history_freq = _infer_single_item_freq(history, request)
-    if inferred_history_freq and not _same_frequency(inferred_history_freq, request.freq):
-        errors.append(f"history frequency mismatch inferred={inferred_history_freq} request={request.freq}")
-    errors.extend(_history_continuity_errors(history, request))
+    history["timestamp"] = pd.to_datetime(history["timestamp"])
+    history = history.sort_values(["timestamp"])
+    if history.duplicated(["timestamp"]).any():
+        errors.append("history_load contains duplicate timestamp rows")
+    inferred_history_freq = _infer_single_item_freq(history)
+    if inferred_history_freq and not _same_frequency(inferred_history_freq, request.task.freq):
+        errors.append(f"history frequency mismatch inferred={inferred_history_freq} request={request.task.freq}")
+    errors.extend(_history_continuity_errors(history, request.task.freq))
 
     if known_frame.empty:
         return errors
     known = known_frame.copy()
-    known[request.timestamp_col] = pd.to_datetime(known[request.timestamp_col])
-    known = known.sort_values([request.item_id_col, request.timestamp_col])
-    if known.duplicated([request.item_id_col, request.timestamp_col]).any():
-        errors.append("known_covariates contains duplicate item_id/timestamp rows")
+    known["timestamp"] = pd.to_datetime(known["timestamp"])
+    known = known.sort_values(["timestamp"])
+    if known.duplicated(["timestamp"]).any():
+        errors.append("future_covariates contains duplicate timestamp rows")
 
-    for item_id, item_history in history.groupby(request.item_id_col, sort=False):
-        item_known = known[known[request.item_id_col] == item_id]
-        if item_known.empty:
-            errors.append(f"known_covariates missing rows for item_id={item_id}")
-            continue
-        last_history_timestamp = pd.Timestamp(item_history[request.timestamp_col].max())
-        expected_index = pd.date_range(
-            last_history_timestamp,
-            periods=request.prediction_length + 1,
-            freq=request.freq,
-        )[1:]
-        actual_index = pd.to_datetime(item_known[request.timestamp_col]).head(
-            request.prediction_length
+    last_history_timestamp = pd.Timestamp(history["timestamp"].max())
+    expected_index = pd.date_range(
+        last_history_timestamp,
+        periods=request.task.prediction_length + 1,
+        freq=request.task.freq,
+    )[1:]
+    actual_index = pd.to_datetime(known["timestamp"]).head(request.task.prediction_length)
+    if len(actual_index) < request.task.prediction_length:
+        errors.append(
+            f"future_covariates has {len(actual_index)} rows, expected {request.task.prediction_length}"
         )
-        if len(actual_index) < request.prediction_length:
-            errors.append(
-                f"known_covariates item_id={item_id} has {len(actual_index)} rows, expected {request.prediction_length}"
-            )
-            continue
-        if not actual_index.reset_index(drop=True).equals(pd.Series(expected_index)):
-            errors.append(
-                f"known_covariates timestamps for item_id={item_id} do not match expected future horizon"
-            )
+        return errors
+    if not actual_index.reset_index(drop=True).equals(pd.Series(expected_index)):
+        errors.append("future_covariates timestamps do not match expected future horizon")
     return errors
 
 
-def _infer_single_item_freq(
-    frame: pd.DataFrame,
-    request: OnlineInferenceRequest,
-) -> str | None:
-    frequencies = []
-    for _, group in frame.groupby(request.item_id_col, sort=False):
-        if len(group) < 3:
-            continue
-        inferred = pd.infer_freq(pd.to_datetime(group[request.timestamp_col]))
-        if inferred:
-            frequencies.append(inferred)
-    unique = set(frequencies)
-    return unique.pop() if len(unique) == 1 else None
+def _infer_single_item_freq(frame: pd.DataFrame) -> str | None:
+    if len(frame) < 3:
+        return None
+    return pd.infer_freq(pd.to_datetime(frame["timestamp"]))
 
 
 def _history_continuity_errors(
     history: pd.DataFrame,
-    request: OnlineInferenceRequest,
+    freq: str,
 ) -> list[str]:
     errors: list[str] = []
-    for item_id, group in history.groupby(request.item_id_col, sort=False):
-        if len(group) < 2:
-            continue
-        expected_index = pd.date_range(
-            pd.Timestamp(group[request.timestamp_col].min()),
-            pd.Timestamp(group[request.timestamp_col].max()),
-            freq=request.freq,
-        )
-        actual_index = pd.DatetimeIndex(pd.to_datetime(group[request.timestamp_col]))
-        if len(expected_index) != len(actual_index) or not actual_index.equals(expected_index):
-            errors.append(f"history timestamps for item_id={item_id} are not continuous at freq={request.freq}")
+    if len(history) < 2:
+        return errors
+    expected_index = pd.date_range(
+        pd.Timestamp(history["timestamp"].min()),
+        pd.Timestamp(history["timestamp"].max()),
+        freq=freq,
+    )
+    actual_index = pd.DatetimeIndex(pd.to_datetime(history["timestamp"]))
+    if len(expected_index) != len(actual_index) or not actual_index.equals(expected_index):
+        errors.append(f"history timestamps are not continuous at freq={freq}")
     return errors
 
 
@@ -429,29 +490,31 @@ def normalize_forecast_frame(forecast: ForecastFrame) -> ForecastFrame:
 
 def _dataset_from_records(
     records: list[dict[str, Any]],
-    timestamp_col: str,
-    target_col: str,
-    item_id_col: str,
+    item_id: str,
     freq: str,
 ) -> TimeSeriesDataset:
-    frame = pd.DataFrame(records)
+    frame = pd.DataFrame(records).copy()
+    frame["item_id"] = item_id
+    frame = frame.rename(columns={"actual_load": "target"})
     return TimeSeriesDataset(
         frame=frame,
-        timestamp_col=timestamp_col,
-        target_col=target_col,
-        item_id_col=item_id_col,
+        timestamp_col="timestamp",
+        target_col="target",
+        item_id_col="item_id",
         freq=freq,
     )
 
 
 def _frame_from_records(
     records: list[dict[str, Any]],
-    timestamp_col: str,
+    item_id: str | None = None,
 ) -> pd.DataFrame | None:
     if not records:
         return None
     frame = pd.DataFrame(records)
-    frame[timestamp_col] = pd.to_datetime(frame[timestamp_col])
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    if item_id is not None:
+        frame["item_id"] = item_id
     return frame
 
 
@@ -459,6 +522,50 @@ def _forecast_records(forecast: ForecastFrame) -> list[dict[str, Any]]:
     frame = forecast.frame.copy()
     frame[forecast.timestamp_col] = pd.to_datetime(frame[forecast.timestamp_col])
     return _json_records(frame)
+
+
+def _response_protocol_dict(response: OnlineInferenceResponse) -> dict[str, Any]:
+    results = [_response_result_record(record, response.item_id) for record in response.forecast]
+    model_name = response.model_name or response.model_type
+    return {
+        "code": 0,
+        "message": None,
+        "request_id": response.request_id,
+        "response_id": response.response_id,
+        "task_status": response.task_status,
+        "item_id": response.item_id,
+        "response_time": response.response_time,
+        "model": {
+            "model_type": response.model_type,
+            "model_name": model_name,
+            "model_version": response.model_version,
+            "scale_name": response.scale_name,
+        },
+        "task": {
+            "task_type": response.task_type,
+            "forecast_type": response.forecast_type,
+            "forecast_scale": response.forecast_scale,
+            "prediction_length": response.prediction_length,
+            "freq": response.freq,
+        },
+        "results": results,
+        "summary": {
+            "item_count": 1 if response.item_id else 0,
+            "forecast_steps": len(results),
+            "clipped_negative_count": 0,
+            "missing_covariate_count": 0,
+            "invalid_row_count": 0,
+            "model_inference_time_ms": response.model_inference_time_ms,
+        },
+        "warnings": response.warnings,
+    }
+
+
+def _response_result_record(record: dict[str, Any], response_item_id: str | None) -> dict[str, Any]:
+    result = dict(record)
+    if response_item_id is not None:
+        result.pop("item_id", None)
+    return result
 
 
 def _json_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
@@ -473,13 +580,22 @@ def _json_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return records
 
 
+def _postprocess_config_from_manifest(manifest: ModelManifest) -> ForecastPostprocessingConfig:
+    payload = dict(manifest.postprocess_config or {})
+    distribution_grid_values = payload.get("distribution_grid")
+    if isinstance(distribution_grid_values, dict):
+        payload["distribution_grid"] = DistributionGridConfig(**distribution_grid_values)
+    return ForecastPostprocessingConfig(**payload)
+
+
 def _log_online_response(response: OnlineInferenceResponse) -> None:
     sample = response.forecast[0] if response.forecast else {}
     logger.info(
-        "Online inference response model_type=%s prediction_length=%s freq=%s rows=%s sample=%s",
+        "Online inference response model_type=%s prediction_length=%s freq=%s rows=%s sample=%s model_inference_time_ms=%.3f",
         response.model_type,
         response.prediction_length,
         response.freq,
         len(response.forecast),
         sample,
+        response.model_inference_time_ms or 0.0,
     )

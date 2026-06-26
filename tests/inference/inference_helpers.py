@@ -76,7 +76,7 @@ def _run_request_json_inference_case_with_horizon(
     request_seconds = perf_counter() - request_started
 
     response_path = INFERENCE_OUTPUT_DIR / f"{model_type}_{prediction_length}_{freq}_response.json"
-    response = run_online_inference_from_json(request_path, output_path=response_path)
+    response = run_online_inference_from_json(request_path, model_path=model_path, output_path=response_path)
     total_seconds = perf_counter() - total_started
     logger.info(
         "online_inference_timing model_type=%s request_seconds=%.6f total_seconds=%.6f rows=%s request_json=%s response_json=%s",
@@ -98,16 +98,17 @@ def _assert_inference_response(
     model_type: str,
 ) -> None:
     assert response.model_type == model_type
-    assert response.prediction_length == request.prediction_length
-    assert response.freq == request.freq
-    assert len(response.forecast) == request.prediction_length
+    assert response.prediction_length == request.task.prediction_length
+    assert response.freq == request.task.freq
+    assert response.request_id == request.request_id
+    assert len(response.forecast) == request.task.prediction_length
     first = response.forecast[0]
-    first_history = request.history[0]
-    first_known_covariates = request.known_covariates[0]
+    first_history = request.history_load[0]
+    first_known_covariates = request.future_covariates[0]
     assert EXPECTED_KNOWN_COVARIATES.issubset(first_history)
     assert EXPECTED_KNOWN_COVARIATES.issubset(first_known_covariates)
-    assert "target" in first_history
-    assert "target" not in first_known_covariates
+    assert "actual_load" in first_history
+    assert "actual_load" not in first_known_covariates
     expected_columns = {
         "item_id",
         "timestamp",
@@ -129,10 +130,24 @@ def _assert_inference_response(
 def _assert_response_json(path: Path, response: OnlineInferenceResponse) -> None:
     assert path.exists()
     values = json.loads(path.read_text(encoding="utf-8"))
-    assert values["model_type"] == response.model_type
-    assert values["prediction_length"] == response.prediction_length
-    assert values["freq"] == response.freq
-    assert len(values["forecast"]) == len(response.forecast)
+    assert values["code"] == 0
+    assert values["request_id"] == response.request_id
+    assert values["response_id"] == response.response_id
+    assert values["response_id"] == values["request_id"]
+    assert values["task_status"] == "COMPLETED"
+    assert values["item_id"] == response.item_id
+    assert values["model"]["model_type"] == response.model_type
+    assert values["model"]["model_name"] == response.model_name
+    assert values["model"]["model_version"] == response.model_version
+    assert values["task"]["task_type"] == "load_forecast"
+    assert values["task"]["forecast_type"] == response.forecast_type
+    assert values["task"]["forecast_scale"] == response.forecast_scale
+    assert values["task"]["prediction_length"] == response.prediction_length
+    assert values["task"]["freq"] == response.freq
+    assert isinstance(values["summary"]["model_inference_time_ms"], float)
+    assert values["summary"]["model_inference_time_ms"] >= 0
+    assert len(values["results"]) == len(response.forecast)
+    assert "item_id" not in values["results"][0]
 
 
 def _log_inference_response(response: OnlineInferenceResponse) -> None:
@@ -145,6 +160,13 @@ def _log_inference_response(response: OnlineInferenceResponse) -> None:
         len(response.forecast),
         sample,
     )
+
+
+def _load_request_for_model(model_type: str) -> tuple[object, object]:
+    request_path = REQUEST_INPUT_DIR / f"{model_type}_96_15min_prediction_request.json"
+    if not request_path.exists():
+        pytest.skip(f"Online request JSON is not available: {request_path}")
+    return load_online_inference_request(request_path), request_path
 
 
 def run_lightgbm_request_json_inference():

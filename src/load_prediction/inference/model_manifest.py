@@ -48,8 +48,8 @@ def build_model_manifest(config: PipelineConfig) -> ModelManifest:
         target_col="target",
         item_id_col="item_id",
         required_known_covariates=known_covariates,
-        required_history_columns=["timestamp", "item_id", "target", *known_covariates],
-        required_known_covariate_columns=["timestamp", "item_id", *known_covariates],
+        required_history_columns=["timestamp", "actual_load", *known_covariates],
+        required_known_covariate_columns=["timestamp", *known_covariates],
         required_history_length=_required_history_length(config),
         cleaning_config=asdict(config.cleaning),
         online_request_contract=_online_request_contract(config),
@@ -80,6 +80,7 @@ def load_model_manifest(model_path: str | Path) -> ModelManifest:
     values = json.loads(manifest_path.read_text(encoding="utf-8"))
     values.setdefault("cleaning_config", {})
     values.setdefault("online_request_contract", _default_online_request_contract(values))
+    values = _normalize_loaded_manifest(values)
     return ModelManifest(**values)
 
 
@@ -162,3 +163,40 @@ def _default_online_request_contract(values: dict[str, Any]) -> dict[str, Any]:
         "requires_full_known_covariate_horizon": True,
         "forbids_future_target_in_known_covariates": True,
     }
+
+
+def _normalize_loaded_manifest(values: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(values)
+    history_columns = list(normalized.get("required_history_columns") or [])
+    covariate_columns = list(normalized.get("required_known_covariate_columns") or [])
+
+    normalized["required_history_columns"] = _normalize_history_columns(history_columns)
+    normalized["required_known_covariate_columns"] = _normalize_known_covariate_columns(covariate_columns)
+    normalized["required_history_length"] = int(normalized.get("required_history_length") or 1)
+    normalized["required_known_covariates"] = [
+        column for column in normalized.get("required_known_covariates") or [] if column != "item_id"
+    ]
+    return normalized
+
+
+def _normalize_history_columns(columns: list[str]) -> list[str]:
+    normalized = []
+    for column in columns:
+        if column == "target":
+            normalized.append("actual_load")
+        elif column == "item_id":
+            continue
+        else:
+            normalized.append(column)
+    if "timestamp" not in normalized:
+        normalized.insert(0, "timestamp")
+    if "actual_load" not in normalized:
+        normalized.append("actual_load")
+    return normalized
+
+
+def _normalize_known_covariate_columns(columns: list[str]) -> list[str]:
+    normalized = [column for column in columns if column != "item_id"]
+    if "timestamp" not in normalized:
+        normalized.insert(0, "timestamp")
+    return normalized

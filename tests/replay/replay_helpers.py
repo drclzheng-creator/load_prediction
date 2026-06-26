@@ -6,10 +6,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from load_prediction.configs import ModelSpecConfig, ArtifactConfig, PipelineConfig
+from load_prediction.configs import ModelSpecConfig, PipelineConfig
 from load_prediction.data import CSVLoadDataLoader
-from load_prediction.inference import OnlineInferenceRequest, run_online_inference
-from load_prediction.pipeline.forecast_pipeline import LoadForecastPipeline
+from load_prediction.inference import OnlineInferenceRequest, OnlineInferenceTask, run_online_inference
+from load_prediction.preprocessing import TimeSeriesCleaner
 
 
 DEFAULT_CONFIG = Path("configs/day_ahead.yaml")
@@ -36,33 +36,36 @@ def _compact_replay_config(
 ) -> PipelineConfig:
     base = PipelineConfig.from_yaml(config_path)
     return PipelineConfig(
-        data=base.data.__class__(
-            **{
-                **base.data.__dict__,
-                "start_time": "2019-01-01 00:00:00",
-                "end_time": "2019-01-31 23:45:00",
-            }
-        ),
+        data=base.data,
         cleaning=base.cleaning,
         model=model or _lightgbm_replay_model(),
-        evaluation=base.evaluation.__class__(
-            **{
-                **base.evaluation.__dict__,
-                "split_strategy": "ratio",
-                "train_ratio": None,
-                "holdout_length": base.scale.prediction_length * REPLAY_WINDOW_COUNT,
-            }
-        ),
+        evaluation=base.evaluation,
         postprocess=base.postprocess,
-        output=ArtifactConfig(
-            root_dir=str(tmp_path),
-            save_model=True,
-            save_artifacts=True,
-            save_plot=False,
-            save_metrics=True,
-        ),
+        output=base.output,
         scale=base.scale,
     )
+
+
+def _replay_artifacts(config: PipelineConfig) -> tuple[Path, Path]:
+    model_name = _model_type(config.model.name)
+    scale_name = config.scale.name
+    if model_name == "lightgbm" and scale_name == "day_ahead":
+        return Path("outputs/lightgbm/day_ahead/model/model.joblib"), Path(
+            "outputs/lightgbm/day_ahead/artifacts/forecast.csv"
+        )
+    if model_name == "lightgbm" and scale_name == "short_term_4h":
+        return Path("outputs/lightgbm/short_term_4h/model/model.joblib"), Path(
+            "outputs/lightgbm/short_term_4h/artifacts/forecast.csv"
+        )
+    if model_name == "gmm" and scale_name == "day_ahead":
+        return Path("outputs/gmm/day_ahead/e2e_probability_plots/model/model.joblib"), Path(
+            "outputs/gmm/day_ahead/e2e_probability_plots/artifacts/forecast.csv"
+        )
+    if model_name == "lstm" and scale_name == "day_ahead":
+        return Path("outputs/lstm/day_ahead/model/model.pt"), Path("outputs/lstm/day_ahead/artifacts/forecast.csv")
+    if model_name == "autogluon" and scale_name == "day_ahead":
+        return Path("outputs/autogluon/day_ahead/model"), Path("outputs/autogluon/day_ahead/artifacts/forecast.csv")
+    raise ValueError(f"Unsupported replay artifacts for model_name={model_name} scale_name={scale_name}")
 
 
 def _lightgbm_replay_model() -> ModelSpecConfig:
@@ -106,6 +109,10 @@ def _model_type(model_name: str) -> str:
         return "lightgbm"
     if model_name in {"gmm", "gaussian_mixture", "gaussian_mixture_model"}:
         return "gmm"
+    if model_name in {"lstm", "torch_lstm", "bilstm", "bi_lstm"}:
+        return "lstm"
+    if model_name in {"autogluon", "autogluon_timeseries"}:
+        return "autogluon"
     return model_name
 
 
@@ -140,93 +147,146 @@ def _assert_forecast_frames_allclose(offline: pd.DataFrame, online: pd.DataFrame
         )
 
 
-def _history_for_replay_window(result, window_index: int, prediction_length: int) -> pd.DataFrame:
-    end = (window_index - 1) * prediction_length
-    if end <= 0:
-        return result.train_data.frame.copy()
-    prior_test = result.test_data.frame.groupby(
-        result.test_data.item_id_col,
-        sort=False,
-    ).head(end)
-    return pd.concat([result.train_data.frame, prior_test], ignore_index=True)
+def _history_for_replay_window(
+    cleaned_data,
+    window_index: int,
+    offline_forecast: pd.DataFrame,
+) -> pd.DataFrame:
+    window = offline_forecast[offline_forecast["evaluation_window"] == window_index].sort_values(
+        ["item_id", "timestamp"]
+    )
+    start_timestamp = pd.Timestamp(window["timestamp"].min())
+    item_id = str(window["item_id"].iloc[0])
+    history = cleaned_data.frame[
+        (cleaned_data.frame[cleaned_data.item_id_col].astype(str) == item_id)
+        & (cleaned_data.frame[cleaned_data.timestamp_col] < start_timestamp)
+    ].copy()
+    return history
 
 
 def _known_covariates_for_replay_window(
-    result,
     config: PipelineConfig,
+    cleaned_data,
+    offline_window: pd.DataFrame,
     window_index: int,
-    prediction_length: int,
 ) -> pd.DataFrame:
-    start = (window_index - 1) * prediction_length
-    end = start + prediction_length
-    window = result.test_data.frame.iloc[start:end]
+    item_id = str(offline_window["item_id"].iloc[0])
+    timestamps = pd.to_datetime(offline_window["timestamp"])
+    window = cleaned_data.frame[
+        (cleaned_data.frame[cleaned_data.item_id_col].astype(str) == item_id)
+        & (cleaned_data.frame[cleaned_data.timestamp_col].isin(timestamps))
+    ].copy()
     return window[
         [
-            result.test_data.timestamp_col,
-            result.test_data.item_id_col,
+            cleaned_data.timestamp_col,
+            cleaned_data.item_id_col,
             *config.scale.feature.known_covariates,
         ]
     ]
 
 
 def _online_forecast_for_replay_window(
-    result,
     config: PipelineConfig,
+    cleaned_data,
+    offline_forecast: pd.DataFrame,
     window_index: int,
-    prediction_length: int,
+    model_path: Path,
 ) -> pd.DataFrame:
-    history = _history_for_replay_window(result, window_index, prediction_length)
+    offline_window = offline_forecast[offline_forecast["evaluation_window"] == window_index].sort_values(
+        ["item_id", "timestamp"]
+    )
+    prediction_length = int(offline_window["timestamp"].nunique())
+    history = _history_for_replay_window(cleaned_data, window_index, offline_forecast)
     known_covariates = _known_covariates_for_replay_window(
-        result,
         config,
+        cleaned_data,
+        offline_window,
         window_index,
-        prediction_length,
     )
     request = OnlineInferenceRequest(
-        model_path=str(result.model_path),
-        model_type=_model_type(config.model.name),
-        history=_json_records(history),
-        known_covariates=_json_records(known_covariates),
-        prediction_length=prediction_length,
-        freq=config.scale.freq,
-        timestamp_col=result.train_data.timestamp_col,
-        target_col=result.train_data.target_col,
-        item_id_col=result.train_data.item_id_col,
-        postprocess=config.postprocess,
+        request_id=None,
+        request_time=None,
+        item_id=str(offline_window["item_id"].iloc[0]),
+        task=OnlineInferenceTask(
+            task_type="load_forecast",
+            forecast_type="point",
+            forecast_scale=config.scale.name,
+            prediction_length=prediction_length,
+            freq=config.scale.freq,
+        ),
+        history_load=_history_load_records(
+            history,
+            timestamp_col=cleaned_data.timestamp_col,
+            target_col=cleaned_data.target_col,
+            item_id_col=cleaned_data.item_id_col,
+        ),
+        future_covariates=_future_covariate_records(
+            known_covariates,
+            timestamp_col=cleaned_data.timestamp_col,
+            target_col=cleaned_data.target_col,
+            item_id_col=cleaned_data.item_id_col,
+        ),
+        forecast_options={},
+        trace={},
     )
 
-    response = run_online_inference(request)
+    response = run_online_inference(request, model_path=model_path)
     online = pd.DataFrame(response.forecast)
-    online[request.timestamp_col] = pd.to_datetime(online[request.timestamp_col])
-    return online.sort_values([request.item_id_col, request.timestamp_col])
+    online["timestamp"] = pd.to_datetime(online["timestamp"])
+    return online.sort_values(["item_id", "timestamp"])
+
+
+def _history_load_records(
+    frame: pd.DataFrame,
+    timestamp_col: str,
+    target_col: str,
+    item_id_col: str,
+) -> list[dict[str, object]]:
+    payload = frame.drop(columns=[item_id_col]).rename(columns={timestamp_col: "timestamp", target_col: "actual_load"})
+    return _json_records(payload)
+
+
+def _future_covariate_records(
+    frame: pd.DataFrame,
+    timestamp_col: str,
+    target_col: str,
+    item_id_col: str,
+) -> list[dict[str, object]]:
+    payload = frame.drop(columns=[target_col, item_id_col], errors="ignore").rename(
+        columns={timestamp_col: "timestamp"}
+    )
+    return _json_records(payload)
 
 
 def _assert_replay_ten_rolling_windows_allclose(config: PipelineConfig) -> None:
+    model_path, forecast_csv_path = _replay_artifacts(config)
+    assert model_path.exists()
+    assert forecast_csv_path.exists()
+
     data = CSVLoadDataLoader(config.data).load(Path(config.data.path))
-    result = LoadForecastPipeline(config).run(data)
-    assert result.model_path is not None
+    cleaned = TimeSeriesCleaner(config.cleaning).fit_transform(data)
+    offline_forecast = pd.read_csv(forecast_csv_path)
+    offline_forecast["timestamp"] = pd.to_datetime(offline_forecast["timestamp"])
 
-    prediction_length = config.scale.prediction_length
-    assert result.forecast.frame["evaluation_window"].nunique() == REPLAY_WINDOW_COUNT
+    available_windows = sorted(int(value) for value in offline_forecast["evaluation_window"].dropna().unique())
+    assert len(available_windows) >= REPLAY_WINDOW_COUNT
+    sampled_windows = np.random.default_rng(42).choice(available_windows, size=REPLAY_WINDOW_COUNT, replace=False)
+    sampled_windows = sorted(int(value) for value in sampled_windows)
 
-    for window_index in range(1, REPLAY_WINDOW_COUNT + 1):
-        offline_window = result.forecast.frame[
-            result.forecast.frame["evaluation_window"] == window_index
-        ].sort_values([result.forecast.item_id_col, result.forecast.timestamp_col])
-        assert len(offline_window) == prediction_length
+    for window_index in sampled_windows:
+        offline_window = offline_forecast[offline_forecast["evaluation_window"] == window_index].sort_values(
+            ["item_id", "timestamp"]
+        )
 
         online = _online_forecast_for_replay_window(
-            result,
             config,
+            cleaned,
+            offline_forecast,
             window_index,
-            prediction_length,
+            model_path,
         )
-        assert online[
-            [result.forecast.item_id_col, result.forecast.timestamp_col]
-        ].reset_index(drop=True).equals(
-            offline_window[
-                [result.forecast.item_id_col, result.forecast.timestamp_col]
-            ].reset_index(drop=True)
+        assert online[["item_id", "timestamp"]].reset_index(drop=True).equals(
+            offline_window[["item_id", "timestamp"]].reset_index(drop=True)
         )
         _assert_forecast_frames_allclose(
             offline_window.reset_index(drop=True),
@@ -250,4 +310,59 @@ def run_short_term_4h_lightgbm_replay(tmp_path):
 
 def run_gmm_replay(tmp_path):
     config = _compact_replay_config(tmp_path, model=_gmm_replay_model())
+    _assert_replay_ten_rolling_windows_allclose(config)
+
+
+def _lstm_replay_model() -> ModelSpecConfig:
+    return ModelSpecConfig(
+        name="lstm",
+        random_state=42,
+        params={
+            "context_length": 672,
+            "hidden_size": 64,
+            "num_layers": 1,
+            "dropout": 0.1,
+            "epochs": 20,
+            "batch_size": 128,
+            "learning_rate": 0.001,
+            "weight_decay": 0.0,
+            "max_train_samples": 4096,
+            "train_sample_strategy": "last",
+            "device": "cpu",
+            "validation_fraction": 0.1,
+            "early_stopping_patience": 3,
+            "early_stopping_min_delta": 1e-4,
+            "use_point_head": False,
+            "nll_loss_weight": 1.0,
+            "point_loss_weight": 0.0,
+        },
+    )
+
+
+def _autogluon_replay_model() -> ModelSpecConfig:
+    return ModelSpecConfig(
+        name="autogluon",
+        random_state=42,
+        params={
+            "eval_metric": "MAE",
+            "presets": "medium_quality",
+            "time_limit": 300,
+            "enable_ensemble": False,
+            "quantile_levels": [0.1, 0.9],
+            "hyperparameters": {
+                "RecursiveTabular": {
+                    "model_name": "GBM",
+                },
+            },
+        },
+    )
+
+
+def run_lstm_replay(tmp_path):
+    config = _compact_replay_config(tmp_path, model=_lstm_replay_model())
+    _assert_replay_ten_rolling_windows_allclose(config)
+
+
+def run_autogluon_replay(tmp_path):
+    config = _compact_replay_config(tmp_path, model=_autogluon_replay_model())
     _assert_replay_ten_rolling_windows_allclose(config)
